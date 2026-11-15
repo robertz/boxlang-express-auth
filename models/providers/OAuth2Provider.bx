@@ -14,8 +14,9 @@
  *   authorizationUrl( state, codeVerifier, nonce, callbackUrl ) → string
  *   exchangeCode( code, codeVerifier, callbackUrl )              → { accessToken, tokenType, scope[, idToken] }
  *   fetchProfile( tokens, context ) → { provider, id, email, emailVerified, name, username, avatarUrl, raw }
- *     context = { nonce } — the nonce minted for this login, for providers
- *     that must check it (OIDC id_token); plain OAuth2 ignores it.
+ *     context = { nonce, state } — the nonce minted for this login, for
+ *     providers that must check it (OIDC id_token), and the login's state;
+ *     plain OAuth2 ignores both.
  *
  * exchangeCode() and fetchProfile() throw on failure; Auth turns any throw
  * into a failureRedirect. Messages from those throws are logged, so they
@@ -135,7 +136,7 @@ class {
 				"code": code,
 				"redirect_uri": callbackUrl,
 				"client_id": variables.clientId,
-				"client_secret": variables.clientSecret,
+				"client_secret": clientSecretValue(),
 				"code_verifier": codeVerifier
 			}
 		} )
@@ -170,6 +171,14 @@ class {
 			tokens.idToken = payload.id_token
 		}
 		return tokens
+	}
+
+	/**
+	 * The client_secret sent to the token endpoint. A fixed string here;
+	 * Apple overrides it to mint a signed JWT per exchange.
+	 */
+	function clientSecretValue() {
+		return variables.clientSecret
 	}
 
 	function fetchProfile( required struct tokens, struct context = {} ) {

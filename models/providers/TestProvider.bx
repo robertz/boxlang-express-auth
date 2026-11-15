@@ -1,0 +1,235 @@
+/**
+ * A provider for an app's own specs: logs in as whatever identity the spec
+ * names, through the real /auth routes (state, PKCE, verify(), session
+ * regeneration and all), with no network and no provider account.
+ *
+ *   testLogin = boxExpressAuthTestProvider( { identity: { id: "u1", email: "ada@example.com" } } )
+ *   auth.provider( "test", testLogin )
+ *
+ *   var login = testLogin.login( app )                      // → { response, cookies, location }
+ *   app.inject( { url: "/dashboard", cookies: login.cookies } )
+ *   testLogin.login( app, { identity: { id: "u2" }, returnTo: "/settings" } )
+ *   testLogin.login( app, { deny: "access_denied" } )       // the user said no
+ *   testLogin.login( app, { fail: "profile_failed" } )      // the provider broke
+ *
+ * It can't be used to log in from a browser: GET /auth/test redirects to a
+ * host under .invalid, which never resolves, and the only way to get a
+ * code the callback accepts is approve() — a method on this object, which
+ * only code in the same process can call. Still, register it only in
+ * tests.
+ */
+class {
+
+	variables.AUTHORIZE_URL = "https://auth.test.invalid/authorize"
+	variables.FAILURES = [ "token_exchange_failed", "profile_failed" ]
+
+	function init( struct options = {} ) {
+		this.name = options.name ?: "test"
+		this.callbackUrl = options.callbackUrl ?: "http://localhost/auth/#this.name#/callback"
+		if ( !reFindNoCase( "^https?://[^/]+/.*/callback$", this.callbackUrl ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "The test provider's callbackUrl must be an absolute http(s) URL ending in /callback"
+			)
+		}
+		variables.defaultIdentity = {
+			id: "test-user",
+			email: "test@example.com",
+			emailVerified: true,
+			name: "Test User",
+			username: "test",
+			avatarUrl: ""
+		}
+		variables.defaultIdentity.append( options.identity ?: {}, true )
+		variables.codes = {}
+		variables.accessTokens = {}
+		variables.lockName = "boxexpressauth-test-" & createUUID()
+		variables.crypto = new "../Crypto"()
+		return this
+	}
+
+	function authorizationUrl( required string state, required string codeVerifier, string nonce = "", string callbackUrl = this.callbackUrl ) {
+		var encoder = createObject( "java", "java.net.URLEncoder" )
+		var params = [
+			[ "response_type", "code" ],
+			[ "client_id", "boxexpress-auth-test" ],
+			[ "redirect_uri", callbackUrl ],
+			[ "state", state ],
+			[ "code_challenge", variables.crypto.s256( codeVerifier ) ],
+			[ "code_challenge_method", "S256" ],
+			[ "nonce", nonce ]
+		]
+		return variables.AUTHORIZE_URL & "?" & params.map( ( pair ) => encoder.encode( pair[ 1 ], "UTF-8" ) & "=" & encoder.encode( pair[ 2 ], "UTF-8" ) ).toList( "&" )
+	}
+
+	/**
+	 * What the provider would do when the user clicks "Allow": the callback
+	 * path (with code and state) to inject next.
+	 *
+	 * @authorizeLocation the Location GET /auth/<name> redirected to
+	 * @identity          merged over the provider's default identity
+	 * @fail              "token_exchange_failed" or "profile_failed" to make that step throw
+	 */
+	function approve( required string authorizeLocation, struct identity = {}, string fail = "" ) {
+		var authorizeRequest = _parseAuthorize( authorizeLocation )
+		if ( len( fail ) && !variables.FAILURES.find( fail ) ) {
+			throw( type = "BoxExpressAuth.InvalidArgument", message = "The test provider's fail must be one of: #variables.FAILURES.toList( ', ' )#" )
+		}
+		var fullIdentity = structCopy( variables.defaultIdentity )
+		fullIdentity.append( identity, true )
+		var code = variables.crypto.randomToken( 16 )
+		lock name=variables.lockName type="exclusive" timeout=5 {
+			variables.codes[ code ] = {
+				identity: fullIdentity,
+				challenge: authorizeRequest.code_challenge ?: "",
+				redirectUri: authorizeRequest.redirect_uri ?: "",
+				fail: fail
+			}
+		}
+		return _callbackPath( authorizeRequest, [ [ "code", code ], [ "state", authorizeRequest.state ?: "" ] ] )
+	}
+
+	/**
+	 * What the provider would do when the user clicks "Cancel": the
+	 * callback path with ?error= and the state.
+	 */
+	function deny( required string authorizeLocation, string error = "access_denied" ) {
+		var authorizeRequest = _parseAuthorize( authorizeLocation )
+		return _callbackPath( authorizeRequest, [ [ "error", error ], [ "state", authorizeRequest.state ?: "" ] ] )
+	}
+
+	/**
+	 * The whole login, start to callback, through app.inject().
+	 *
+	 * @options.identity  merged over the default identity for this login
+	 * @options.returnTo  passed to GET /auth/<name>
+	 * @options.cookies   sent with both requests (an existing session)
+	 * @options.deny      an error code, to have the user refuse instead
+	 * @options.fail      "token_exchange_failed" or "profile_failed"
+	 *
+	 * → { response: the callback's response, location: its Location,
+	 *     cookies: every cookie so far, ready for the next inject(),
+	 *     started: the GET /auth/<name> response }
+	 */
+	function login( required any app, struct options = {} ) {
+		var startQuery = len( options.returnTo ?: "" ) ? { returnTo: options.returnTo } : {}
+		var started = app.inject( { url: startPath(), query: startQuery, cookies: options.cookies ?: {} } )
+		return _finish( app, started, options )
+	}
+
+	/**
+	 * POST /auth/<name>/link for a signed-in user, then the callback.
+	 * Pass the app's CSRF token through headers or form if it checks one.
+	 *
+	 * @options.cookies   the signed-in session (required)
+	 * @options.headers / @options.form  sent with the POST
+	 * plus identity, returnTo, deny and fail as for login()
+	 */
+	function link( required any app, struct options = {} ) {
+		var formFields = structCopy( options.form ?: {} )
+		if ( len( options.returnTo ?: "" ) ) {
+			formFields.returnTo = options.returnTo
+		}
+		var started = app.inject( {
+			method: "POST",
+			url: startPath() & "/link",
+			form: formFields,
+			headers: options.headers ?: {},
+			cookies: options.cookies ?: {}
+		} )
+		return _finish( app, started, options )
+	}
+
+	function _finish( required any app, required any started, required struct options ) {
+		var cookies = structCopy( options.cookies ?: {} )
+		cookies.append( started.cookies, true )
+		var location = started.header( "Location" ) ?: ""
+		if ( !listFind( "302,303", started.statusCode ) || compare( mid( location, 1, len( variables.AUTHORIZE_URL ) ), variables.AUTHORIZE_URL ) != 0 ) {
+			return { response: started, location: location, cookies: cookies, started: started }
+		}
+		var callbackTarget = len( options.deny ?: "" )
+			? deny( location, options.deny )
+			: approve( location, options.identity ?: {}, options.fail ?: "" )
+		var finished = app.inject( { url: callbackTarget, cookies: cookies } )
+		cookies.append( finished.cookies, true )
+		return { response: finished, location: finished.header( "Location" ) ?: "", cookies: cookies, started: started }
+	}
+
+	/**
+	 * The login route this provider answers on, from its callbackUrl:
+	 * "http://localhost/auth/test/callback" → "/auth/test".
+	 */
+	function startPath() {
+		var path = reReplace( this.callbackUrl, "^https?://[^/]+", "" )
+		return reReplace( path, "/callback$", "" )
+	}
+
+	function exchangeCode( required string code, required string codeVerifier, string callbackUrl = this.callbackUrl ) {
+		var entry = ""
+		lock name=variables.lockName type="exclusive" timeout=5 {
+			entry = variables.codes[ code ] ?: ""
+			structDelete( variables.codes, code )
+		}
+		if ( !isStruct( entry ) ) {
+			throw( type = "BoxExpressAuth.TokenExchangeFailed", message = "test token endpoint: unknown or reused code" )
+		}
+		if ( compare( variables.crypto.s256( codeVerifier ), entry.challenge ) != 0 ) {
+			throw( type = "BoxExpressAuth.TokenExchangeFailed", message = "test token endpoint: PKCE verifier doesn't match" )
+		}
+		if ( compare( callbackUrl, entry.redirectUri ) != 0 ) {
+			throw( type = "BoxExpressAuth.TokenExchangeFailed", message = "test token endpoint: redirect_uri doesn't match" )
+		}
+		if ( compare( entry.fail, "token_exchange_failed" ) == 0 ) {
+			throw( type = "BoxExpressAuth.TokenExchangeFailed", message = "test token endpoint failed as asked" )
+		}
+		var accessToken = "test-at-" & variables.crypto.randomToken( 16 )
+		lock name=variables.lockName type="exclusive" timeout=5 {
+			variables.accessTokens[ accessToken ] = entry
+		}
+		return { accessToken: accessToken, tokenType: "bearer", scope: "" }
+	}
+
+	function fetchProfile( required struct tokens, struct context = {} ) {
+		var entry = ""
+		lock name=variables.lockName type="exclusive" timeout=5 {
+			entry = variables.accessTokens[ tokens.accessToken ?: "" ] ?: ""
+			structDelete( variables.accessTokens, tokens.accessToken ?: "" )
+		}
+		if ( !isStruct( entry ) ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "test profile: unknown access token" )
+		}
+		if ( compare( entry.fail, "profile_failed" ) == 0 ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "test profile failed as asked" )
+		}
+		var identity = duplicate( entry.identity )
+		identity.id = toString( identity.id )
+		identity.raw = duplicate( entry.identity )
+		identity.provider = this.name
+		return identity
+	}
+
+	function _parseAuthorize( required string authorizeLocation ) {
+		if ( compare( mid( authorizeLocation, 1, len( variables.AUTHORIZE_URL ) + 1 ), variables.AUTHORIZE_URL & "?" ) != 0 ) {
+			throw(
+				type = "BoxExpressAuth.InvalidArgument",
+				message = "That isn't this test provider's authorize URL — pass the Location that GET #startPath()# redirected to"
+			)
+		}
+		var decoder = createObject( "java", "java.net.URLDecoder" )
+		var parsed = {}
+		for ( var pair in listToArray( mid( authorizeLocation, len( variables.AUTHORIZE_URL ) + 2, len( authorizeLocation ) ), "&" ) ) {
+			var equalsAt = find( "=", pair )
+			if ( equalsAt ) {
+				parsed[ decoder.decode( mid( pair, 1, equalsAt - 1 ), "UTF-8" ) ] = decoder.decode( mid( pair, equalsAt + 1, len( pair ) ), "UTF-8" )
+			}
+		}
+		return parsed
+	}
+
+	function _callbackPath( required struct authorizeRequest, required array params ) {
+		var encoder = createObject( "java", "java.net.URLEncoder" )
+		var path = reReplace( authorizeRequest.redirect_uri ?: this.callbackUrl, "^https?://[^/]+", "" )
+		return path & "?" & params.map( ( pair ) => encoder.encode( pair[ 1 ], "UTF-8" ) & "=" & encoder.encode( pair[ 2 ], "UTF-8" ) ).toList( "&" )
+	}
+
+}

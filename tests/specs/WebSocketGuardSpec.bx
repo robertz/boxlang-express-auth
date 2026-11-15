@@ -1,0 +1,115 @@
+/**
+ * auth.required() as app.ws() upgrade middleware: a signed-in user's
+ * socket opens with req.user set; anyone else gets a plain 401, never a
+ * redirect a socket can't follow.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function beforeAll() {
+		variables.testPort = 38742
+		variables.crlf = char( 13 ) & char( 10 )
+		variables.opened = createObject( "java", "java.util.concurrent.ConcurrentLinkedQueue" ).init()
+
+		var app = boxExpress()
+		app.set( "log", false )
+		var sessions = boxExpressSession()
+		app.use( sessions )
+		variables.testLogin = boxExpressAuthTestProvider( { identity: { id: "ada" } } )
+		var auth = boxExpressAuth( { verify: ( identity ) => { return { id: identity.id } } } )
+		auth.provider( "test", variables.testLogin )
+		app.use( "/auth", auth.routes() )
+
+		var opened = variables.opened
+		app.ws( "/live", ( connection, req ) => {
+			opened.add( req.user.id )
+		}, { use: [ sessions, auth.required() ] } )
+
+		variables.app = app
+		app.listen( port = variables.testPort, options = { block: false } )
+		sleep( 300 )
+	}
+
+	function afterAll() {
+		variables.app.close()
+	}
+
+	/**
+	 * A raw upgrade request: the status line's code and the headers.
+	 */
+	function upgrade( required string path, struct extraHeaders = {} ) {
+		var sock = createObject( "java", "java.net.Socket" ).init( "127.0.0.1", variables.testPort )
+		sock.setSoTimeout( 1500 )
+		var handshake = "GET #path# HTTP/1.1" & variables.crlf & "Host: localhost:#variables.testPort#" & variables.crlf
+			& "Upgrade: websocket" & variables.crlf & "Connection: Upgrade" & variables.crlf
+			& "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" & variables.crlf & "Sec-WebSocket-Version: 13" & variables.crlf
+		for ( var headerName in extraHeaders ) {
+			handshake &= headerName & ": " & extraHeaders[ headerName ] & variables.crlf
+		}
+		sock.getOutputStream().write( ( handshake & variables.crlf ).getBytes( "ISO-8859-1" ) )
+		sock.getOutputStream().flush()
+		var collected = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		try {
+			while ( true ) {
+				var nextByte = sock.getInputStream().read()
+				if ( nextByte == -1 ) {
+					break
+				}
+				collected.write( nextByte )
+				if ( collected.toString( "ISO-8859-1" ).find( variables.crlf & variables.crlf ) ) {
+					break
+				}
+			}
+		} catch ( any e ) {
+		}
+		sock.close()
+		var text = collected.toString( "ISO-8859-1" )
+		return {
+			status: len( text ) ? val( listGetAt( listFirst( text, variables.crlf ), 2, " " ) ) : 0,
+			head: text
+		}
+	}
+
+	function cookieHeader( required struct cookies ) {
+		var pairs = []
+		for ( var cookieName in cookies ) {
+			pairs.append( cookieName & "=" & cookies[ cookieName ] )
+		}
+		return pairs.toList( "; " )
+	}
+
+	function run() {
+
+		describe( "auth.required() on a WebSocket upgrade", function() {
+
+			it( "opens the socket for a signed-in user, with req.user set", function() {
+				variables.opened.clear()
+				var login = variables.testLogin.login( variables.app )
+				var response = upgrade( "/live", { "Cookie": cookieHeader( login.cookies ) } )
+				expect( response.status ).withContext( response.head ).toBe( 101 )
+				sleep( 200 )
+				expect( variables.opened.toArray() ).toBe( [ "ada" ] )
+			} )
+
+			it( "refuses an anonymous upgrade with 401", function() {
+				variables.opened.clear()
+				expect( upgrade( "/live" ).status ).toBe( 401 )
+				expect( variables.opened.size() ).toBe( 0 )
+			} )
+
+			it( "refuses with 401, not a login redirect, even when the upgrade says it accepts HTML", function() {
+				var response = upgrade( "/live", { "Accept": "text/html,application/xhtml+xml" } )
+				expect( response.status ).toBe( 401 )
+				expect( response.head ).notToInclude( "Location:" )
+			} )
+
+			it( "refuses after logout", function() {
+				var login = variables.testLogin.login( variables.app )
+				variables.app.inject( { method: "POST", url: "/auth/logout", cookies: login.cookies } )
+				expect( upgrade( "/live", { "Cookie": cookieHeader( login.cookies ) } ).status ).toBe( 401 )
+			} )
+
+		} )
+
+	}
+
+}

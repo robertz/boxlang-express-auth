@@ -1,0 +1,113 @@
+/**
+ * RP-initiated logout: POST /auth/logout ending the session at the issuer
+ * too, for OIDC providers that opt in with postLogoutRedirectUrl.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	variables.POST_LOGOUT = "https://tracker.test/signed-out"
+
+	function loginCookies( flow ) {
+		var cookies = structCopy( flow.started.cookies )
+		cookies.append( flow.finished.cookies, true )
+		return cookies
+	}
+
+	function logout( app, cookies, boolean browser = true ) {
+		return app.inject( {
+			method: "POST",
+			url: "/auth/logout",
+			cookies: cookies,
+			headers: browser ? { "Accept": "text/html" } : { "Accept": "application/json" }
+		} )
+	}
+
+	function run() {
+
+		describe( "Logout at the issuer", function() {
+
+			it( "is off by default: a local logout, as before", function() {
+				var app = buildOidcApp()
+				var cookies = loginCookies( oidcLogin( app ) )
+				var response = logout( app, cookies, false )
+				expect( response.statusCode ).toBe( 204 )
+				expect( logout( app, loginCookies( oidcLogin( app ) ) ).header( "Location" ) ).toBe( "/" )
+			} )
+
+			it( "sends a browser to the end_session_endpoint with client_id and post_logout_redirect_uri", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				var cookies = loginCookies( oidcLogin( app ) )
+				var response = logout( app, cookies )
+				expect( response.statusCode ).toBe( 303 )
+				var location = response.header( "Location" )
+				expect( location ).toMatch( "^" & reEscape( variables.endpoints.endSession ) & "\?" )
+				expect( queryParam( location, "client_id" ) ).toBe( variables.CLIENT_ID )
+				expect( queryParam( location, "post_logout_redirect_uri" ) ).toBe( variables.POST_LOGOUT )
+				expect( location ).notToInclude( "id_token_hint" )
+			} )
+
+			it( "ends the local session as well", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				var cookies = loginCookies( oidcLogin( app ) )
+				logout( app, cookies )
+				expect( sessionOf( app, cookies ).auth ?: {} ).notToHaveKey( "userId" )
+			} )
+
+			it( "answers a fetch() with 200 and the URL to navigate to", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				var response = logout( app, loginCookies( oidcLogin( app ) ), false )
+				expect( response.statusCode ).toBe( 200 )
+				expect( response.json().logoutUrl ).toInclude( variables.endpoints.endSession & "?" )
+			} )
+
+			it( "keeps no ID token in the session unless logoutIdTokenHint is set", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				var flow = oidcLogin( app )
+				var stored = sessionOf( app, loginCookies( flow ) )
+				expect( stored.auth ).notToHaveKey( "logout" )
+				expect( jsonSerialize( stored ) ).notToInclude( "eyJ" )
+			} )
+
+			it( "with logoutIdTokenHint sends the login's ID token as id_token_hint", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT, logoutIdTokenHint: true } )
+				var flow = oidcLogin( app )
+				var idToken = variables.fake.callsTo( "POST #variables.endpoints.token#" ).len() ? variables.verifyCalls[ 1 ].tokens.idToken : ""
+				expect( idToken ).notToBeEmpty()
+				var cookies = loginCookies( flow )
+				expect( sessionOf( app, cookies ).auth.logout.idToken ).toBe( idToken )
+				expect( queryParam( logout( app, cookies ).header( "Location" ), "id_token_hint" ) ).toBe( idToken )
+			} )
+
+			it( "falls back to a local logout when the issuer has no end_session_endpoint", function() {
+				var app = buildOidcApp( "gitlab", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				var cookies = loginCookies( oidcLogin( app ) )
+				expect( logout( app, cookies, false ).statusCode ).toBe( 204 )
+			} )
+
+			it( "doesn't send an anonymous visitor to the issuer", function() {
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT } )
+				expect( logout( app, {}, false ).statusCode ).toBe( 204 )
+			} )
+
+			it( "ignores a plain-http end_session_endpoint", function() {
+				var endpoints = endpointsFor( "idp" )
+				var doc = discoveryResponses( endpoints )[ "GET #endpoints.discovery#" ].body
+				doc.end_session_endpoint = "http://idp.test/logout"
+				var app = buildOidcApp( "idp", { postLogoutRedirectUrl: variables.POST_LOGOUT }, { "GET #endpoints.discovery#": { body: doc } } )
+				expect( logout( app, loginCookies( oidcLogin( app ) ), false ).statusCode ).toBe( 204 )
+			} )
+
+			it( "needs postLogoutRedirectUrl to be absolute", function() {
+				expect( () => boxExpressAuthOIDC( {
+					issuer: variables.IDP_ISSUER,
+					clientId: "c",
+					clientSecret: "s",
+					callbackUrl: variables.IDP_CALLBACK,
+					postLogoutRedirectUrl: "/signed-out"
+				} ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+		} )
+
+	}
+
+}

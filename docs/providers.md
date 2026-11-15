@@ -11,6 +11,19 @@ you call `auth.provider( name, instance )`.
 | `exchangeCode( code, codeVerifier, callbackUrl )` | Returns `{ accessToken, tokenType, scope }`, plus `idToken` when the provider sent one (more keys are fine). |
 | `fetchProfile( tokens, context )` | Returns the normalized identity (below). `context` is `{ nonce }`. |
 
+Optional members:
+
+| Member | |
+|---|---|
+| `acceptFormPost( fields )` | Present on providers that return with `response_mode=form_post`. Gets the POSTed fields; returns `{ code, state, error }` for the GET callback `Auth` redirects to. Anything else it wants (Apple's `user` name) it must hold itself — it never reaches the URL or the session. |
+
+and two for logging out at the provider:
+
+| Member | |
+|---|---|
+| `logoutState( tokens )` | Called after a successful login. A non-empty struct is kept in the session (`auth.logout`) for `logoutUrl()`; return `{}` to keep nothing. Keep it small, and keep tokens out of it unless the app asked. |
+| `logoutUrl( logoutState )` | Called on `POST /logout` for a signed-in user. A URL sends the browser there after the local session ends; `""` means local logout only. A throw is logged and treated as `""`. |
+
 `exchangeCode()` and `fetchProfile()` signal failure by throwing — `Auth`
 turns any throw into `token_exchange_failed` / `profile_failed` and logs
 `e.type` and `e.message`. **Messages must never include the code, a token, or
@@ -84,6 +97,12 @@ redirects followed, 15s timeout). Pass `httpClient` in the provider options
 to replace it — tests use `tests/helpers/FakeHttpClient.bx`; an app might
 add a proxy or tracing.
 
+`OAuth2Provider` sends `clientSecretValue()` as `client_secret`; it
+returns the configured `clientSecret`, and `Apple.bx` overrides it to mint
+an ES256 JWT per exchange. `fetchProfile()`'s `context` also carries the
+login's `state`, which `Apple.bx` uses to find a name held from the form
+post.
+
 ## OIDC providers
 
 `models/providers/OIDCProvider.bx` is the generic OpenID Connect provider
@@ -97,6 +116,20 @@ add a proxy or tracing.
   against the JWKS, `iss`, `aud`/`azp`, `exp`/`iat`, `nonce` =
   `context.nonce`), optionally merges userinfo, then calls
   `identityFromClaims( claims )`.
+- `logoutState()` / `logoutUrl()` — RP-initiated logout through the
+  discovered `end_session_endpoint`, when `postLogoutRedirectUrl` is set.
+
+Two hooks exist for issuers whose `iss` isn't one fixed string:
+
+- `discoveryIssuerMatches( docIssuer )` — whether the discovery document's
+  `issuer` is acceptable. Default: exactly the configured issuer.
+- `tokenIssuerAllowed( tokenIssuer, claims )` — whether an ID token's `iss`
+  is. Default: exactly one of `acceptedIssuers`.
+
+`Microsoft.bx` overrides both: its multi-tenant discovery document says
+`https://login.microsoftonline.com/{tenantid}/v2.0`, and each token's `iss`
+must be that template filled in with the token's own `tid`. Override them
+only to make the check *different*, never looser than "this exact issuer".
 
 A preset for a specific issuer is a subclass that passes defaults and, if
 needed, overrides `identityFromClaims()` to enforce something extra — see
@@ -124,8 +157,18 @@ class extends="bxModules.boxexpressauth.models.providers.OIDCProvider" {
 }
 ```
 
-ID tokens are verified by `models/Jwt.bx`: RS256/RS384/RS512 only, keys of
-2048 bits or more. Adding ES256 (some IdPs default to it) means teaching
-`Jwt.bx` to build an EC key from a JWK's `crv`/`x`/`y` and to convert the
-JWS signature from its raw `r||s` form to the DER form Java's `Signature`
-expects.
+ID tokens are verified by `models/Jwt.bx`: RS256/384/512 with RSA keys of
+2048 bits or more, and ES256/384/512 with an EC key on the curve the
+algorithm names (P-256/P-384/P-521; the JWK's `crv` must say so too). JWS
+carries an ECDSA signature as raw `r||s`, which Java's
+`SHA256withECDSAinP1363Format` (and the 384/512 variants) reads directly; a
+DER-encoded signature is rejected.
+
+## A test provider
+
+`models/providers/TestProvider.bx` implements the contract without a
+network, for apps' own specs (see the README's *Testing your app*). It is
+also the smallest complete example of the contract: `authorizationUrl()`
+returns an `.invalid` URL, `approve()` stands in for the provider's consent
+screen, and `exchangeCode()` checks the PKCE verifier and `redirect_uri`
+like a real token endpoint.

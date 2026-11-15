@@ -1,0 +1,17 @@
+/**
+ * Global BIF wrapping the GitLab provider.
+ *
+ *   auth.provider( "gitlab", boxExpressAuthGitLab( {
+ *     clientId: getSystemSetting( "GITLAB_CLIENT_ID" ),
+ *     clientSecret: getSystemSetting( "GITLAB_CLIENT_SECRET" ),
+ *     callbackUrl: "https://tracker.example.com/auth/gitlab/callback"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.GitLab( options )
+	}
+
+}

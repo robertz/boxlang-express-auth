@@ -1,0 +1,24 @@
+/**
+ * GitLab sign-in: OIDCProvider pointed at gitlab.com, or at a self-managed
+ * instance through baseUrl. identity.username is the GitLab username
+ * (preferred_username, or nickname on instances that only send that).
+ */
+class extends="OIDCProvider" {
+
+	function init( struct options = {} ) {
+		var baseUrl = reReplace( trim( options.baseUrl ?: "https://gitlab.com" ), "/+$", "" )
+		return super.init( options, {
+			name: "gitlab",
+			issuer: baseUrl
+		} )
+	}
+
+	function identityFromClaims( required struct claims ) {
+		var identity = super.identityFromClaims( claims )
+		if ( !len( identity.username ) ) {
+			identity.username = _string( claims.nickname ?: "" )
+		}
+		return identity
+	}
+
+}

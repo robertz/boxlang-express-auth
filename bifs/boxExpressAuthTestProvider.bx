@@ -1,0 +1,16 @@
+/**
+ * Global BIF wrapping the test provider — for an app's own specs only.
+ *
+ *   testLogin = boxExpressAuthTestProvider( { identity: { id: "u1", email: "ada@example.com" } } )
+ *   auth.provider( "test", testLogin )
+ *   var login = testLogin.login( app )
+ *   app.inject( { url: "/dashboard", cookies: login.cookies } )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.TestProvider( options )
+	}
+
+}

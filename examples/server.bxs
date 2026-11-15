@@ -1,13 +1,21 @@
 /**
- * Runnable login demo for GitHub and/or Google — whichever has credentials.
+ * Runnable login demo for GitHub, Google, Microsoft and/or GitLab —
+ * whichever has credentials.
  *
- *   export GITHUB_CLIENT_ID=...  GITHUB_CLIENT_SECRET=...
- *   export GOOGLE_CLIENT_ID=...  GOOGLE_CLIENT_SECRET=...
+ *   export GITHUB_CLIENT_ID=...     GITHUB_CLIENT_SECRET=...
+ *   export GOOGLE_CLIENT_ID=...     GOOGLE_CLIENT_SECRET=...
+ *   export MICROSOFT_CLIENT_ID=...  MICROSOFT_CLIENT_SECRET=...  MICROSOFT_TENANT=common
+ *   export GITLAB_CLIENT_ID=...     GITLAB_CLIENT_SECRET=...     GITLAB_BASE_URL=https://gitlab.com
+ *   export APPLE_SERVICES_ID=...    APPLE_TEAM_ID=...  APPLE_KEY_ID=...  APPLE_PRIVATE_KEY_PATH=/path/AuthKey.p8
+ *                                   (Apple needs an https BASE_URL on a real domain, e.g. a tunnel)
  *   export BASE_URL=http://localhost:3000      # optional; must match the registered callbacks
  *   boxlang examples/server.bxs                 # from the repo root (needs boxlang_modules/)
  *
  * Callback URLs to register:  <BASE_URL>/auth/github/callback
  *                             <BASE_URL>/auth/google/callback
+ *                             <BASE_URL>/auth/microsoft/callback
+ *                             <BASE_URL>/auth/gitlab/callback
+ *                             <BASE_URL>/auth/apple/callback
  */
 baseUrl = getSystemSetting( "BASE_URL", "http://localhost:3000" )
 port = val( getSystemSetting( "PORT", "3000" ) )
@@ -52,15 +60,44 @@ if ( len( getSystemSetting( "GOOGLE_CLIENT_ID", "" ) ) ) {
 	} ) )
 	providerLabels.google = "Google"
 }
+if ( len( getSystemSetting( "MICROSOFT_CLIENT_ID", "" ) ) ) {
+	auth.provider( "microsoft", boxExpressAuthMicrosoft( {
+		clientId: getSystemSetting( "MICROSOFT_CLIENT_ID" ),
+		clientSecret: getSystemSetting( "MICROSOFT_CLIENT_SECRET", "" ),
+		callbackUrl: baseUrl & "/auth/microsoft/callback",
+		tenant: getSystemSetting( "MICROSOFT_TENANT", "common" )
+	} ) )
+	providerLabels.microsoft = "Microsoft"
+}
+if ( len( getSystemSetting( "GITLAB_CLIENT_ID", "" ) ) ) {
+	auth.provider( "gitlab", boxExpressAuthGitLab( {
+		clientId: getSystemSetting( "GITLAB_CLIENT_ID" ),
+		clientSecret: getSystemSetting( "GITLAB_CLIENT_SECRET", "" ),
+		callbackUrl: baseUrl & "/auth/gitlab/callback",
+		baseUrl: getSystemSetting( "GITLAB_BASE_URL", "https://gitlab.com" )
+	} ) )
+	providerLabels.gitlab = "GitLab"
+}
+if ( len( getSystemSetting( "APPLE_SERVICES_ID", "" ) ) ) {
+	auth.provider( "apple", boxExpressAuthApple( {
+		clientId: getSystemSetting( "APPLE_SERVICES_ID" ),
+		teamId: getSystemSetting( "APPLE_TEAM_ID", "" ),
+		keyId: getSystemSetting( "APPLE_KEY_ID", "" ),
+		privateKey: fileRead( getSystemSetting( "APPLE_PRIVATE_KEY_PATH", "" ) ),
+		callbackUrl: baseUrl & "/auth/apple/callback"
+	} ) )
+	providerLabels.apple = "Apple"
+}
 if ( structIsEmpty( providerLabels ) ) {
-	println( "Set GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET and/or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET first." )
-	println( "Callback URLs to register: #baseUrl#/auth/github/callback, #baseUrl#/auth/google/callback" )
+	println( "Set the client id and secret for at least one of GITHUB_, GOOGLE_, MICROSOFT_, GITLAB_ or APPLE_ first." )
+	println( "Callback URLs to register: #baseUrl#/auth/<github|google|microsoft|gitlab|apple>/callback" )
 	createObject( "java", "java.lang.System" ).exit( 1 )
 }
 
 app = boxExpress()
 app.use( boxExpressSession( { resave: false, saveUninitialized: false } ) )
 app.use( boxExpressUrlencoded() )
+app.use( "/auth", auth.formPostRoutes() )   // Apple's POST callback, ahead of CSRF
 app.use( boxExpressCsrf() )
 app.use( "/auth", auth.routes() )
 

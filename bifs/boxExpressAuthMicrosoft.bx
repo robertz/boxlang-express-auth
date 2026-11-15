@@ -1,0 +1,18 @@
+/**
+ * Global BIF wrapping the Microsoft (Entra ID) provider.
+ *
+ *   auth.provider( "microsoft", boxExpressAuthMicrosoft( {
+ *     clientId: getSystemSetting( "MICROSOFT_CLIENT_ID" ),
+ *     clientSecret: getSystemSetting( "MICROSOFT_CLIENT_SECRET" ),
+ *     callbackUrl: "https://tracker.example.com/auth/microsoft/callback",
+ *     tenant: "organizations"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.Microsoft( options )
+	}
+
+}

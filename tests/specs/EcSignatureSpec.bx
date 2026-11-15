@@ -1,0 +1,73 @@
+/**
+ * ES256/384/512 ID tokens, verified against EC keys in the issuer's JWKS.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	function ecApp( required any issuer, struct providerOptions = {} ) {
+		var endpoints = endpointsFor( "idp" )
+		return buildOidcApp( "idp", providerOptions, { "GET #endpoints.jwks#": { body: issuer.jwks() } } )
+	}
+
+	function run() {
+
+		describe( "OIDC: EC-signed ID tokens", function() {
+
+			it( "accepts ES256, ES384 and ES512", function() {
+				for ( var alg in [ "ES256", "ES384", "ES512" ] ) {
+					var issuer = new tests.helpers.TestIssuer( "ec-1", 0, alg )
+					var app = ecApp( issuer )
+					var flow = oidcLogin( app, {}, ( claims ) => issuer.sign( claims ) )
+					expect( flow.finished.header( "Location" ) ).withContext( alg ).toBe( "/" )
+				}
+			} )
+
+			it( "rejects a tampered ES256 payload", function() {
+				var issuer = new tests.helpers.TestIssuer( "ec-1", 0, "ES256" )
+				var app = ecApp( issuer )
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => {
+					var token = issuer.sign( claims )
+					var parts = listToArray( token, "." )
+					var forged = structCopy( claims )
+					forged.sub = "admin"
+					return parts[ 1 ] & "." & issuer._segment( jsonSerialize( forged ) ) & "." & parts[ 3 ]
+				} ), "profile_failed" )
+			} )
+
+			it( "rejects an ES256 token signed by a different EC key with the same kid", function() {
+				var trusted = new tests.helpers.TestIssuer( "ec-1", 0, "ES256" )
+				var attacker = new tests.helpers.TestIssuer( "ec-1", 0, "ES256" )
+				expectOidcFailure( oidcLogin( ecApp( trusted ), {}, ( claims ) => attacker.sign( claims ) ), "profile_failed" )
+			} )
+
+			it( "rejects a header that says ES256 when the key is on another curve", function() {
+				var p384 = new tests.helpers.TestIssuer( "ec-1", 0, "ES384" )
+				var jwks = p384.jwks()
+				structDelete( jwks.keys[ 1 ], "alg" )
+				var app = buildOidcApp( "idp", {}, { "GET #endpointsFor( 'idp' ).jwks#": { body: jwks } } )
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => p384.sign( claims, { alg: "ES256" }, "SHA256withECDSAinP1363Format" ) ), "profile_failed" )
+			} )
+
+			it( "won't verify an ES256 header against an RSA key", function() {
+				var app = buildOidcApp( "idp" )
+				var ec = new tests.helpers.TestIssuer( "test-key-1", 0, "ES256" )
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => ec.sign( claims ) ), "profile_failed" )
+			} )
+
+			it( "refuses ES256 when algorithms leaves it out", function() {
+				var issuer = new tests.helpers.TestIssuer( "ec-1", 0, "ES256" )
+				expectOidcFailure( oidcLogin( ecApp( issuer, { algorithms: [ "RS256" ] } ), {}, ( claims ) => issuer.sign( claims ) ), "profile_failed" )
+			} )
+
+			it( "treats a DER-encoded or wrong-length signature as invalid, not an error", function() {
+				var issuer = new tests.helpers.TestIssuer( "ec-1", 0, "ES256" )
+				var jwt = new bxModules.boxexpressauth.models.Jwt()
+				var token = issuer.sign( { sub: "x" }, {}, "SHA256withECDSA" )
+				expect( jwt.verify( jwt.decode( token ), issuer.jwk(), "ES256" ) ).toBeFalse()
+				expect( jwt.verify( jwt.decode( issuer.sign( { sub: "x" } ) ), issuer.jwk(), "ES256" ) ).toBeTrue()
+			} )
+
+		} )
+
+	}
+
+}

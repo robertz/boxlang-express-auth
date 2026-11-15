@@ -1,0 +1,19 @@
+/**
+ * Global BIF wrapping the Sign in with Apple provider.
+ *
+ *   auth.provider( "apple", boxExpressAuthApple( {
+ *     clientId: getSystemSetting( "APPLE_SERVICES_ID" ),
+ *     teamId: getSystemSetting( "APPLE_TEAM_ID" ),
+ *     keyId: getSystemSetting( "APPLE_KEY_ID" ),
+ *     privateKey: fileRead( getSystemSetting( "APPLE_PRIVATE_KEY_PATH" ) ),
+ *     callbackUrl: "https://tracker.example.com/auth/apple/callback"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.Apple( options )
+	}
+
+}

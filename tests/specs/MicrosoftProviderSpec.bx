@@ -1,0 +1,114 @@
+/**
+ * The Microsoft (Entra ID) preset: per-tenant issuers behind the
+ * multi-tenant endpoints, tenant restrictions, and an email that's never
+ * reported as verified.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	variables.OTHER_TENANT = "0b6f2c4e-1d2a-4f5b-9c8d-7e6f5a4b3c2d"
+
+	function issuerFor( required string tenantId ) {
+		return "https://login.microsoftonline.com/#tenantId#/v2.0"
+	}
+
+	function run() {
+
+		describe( "Microsoft", function() {
+
+			it( "defaults to the common endpoints", function() {
+				var location = buildOidcApp( "microsoft" ).inject( "/auth/microsoft" ).header( "Location" )
+				expect( location ).toInclude( "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?" )
+				expect( queryParam( location, "scope" ) ).toBe( "openid email profile" )
+			} )
+
+			it( "accepts a token whose iss is its own tenant's, behind the templated discovery issuer", function() {
+				var app = buildOidcApp( "microsoft" )
+				expectOidcSuccess( oidcLogin( app, { preferred_username: "ada@contoso.com" } ) )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.provider ).toBe( "microsoft" )
+				expect( identity.id ).toBe( "user-123" )
+				expect( identity.tenantId ).toBe( variables.MS_TENANT )
+				expect( identity.username ).toBe( "ada@contoso.com" )
+			} )
+
+			it( "never reports the email as verified", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "microsoft" ), { email_verified: true } ) )
+				expect( variables.verifyCalls[ 1 ].identity.email ).toBe( "ada@example.com" )
+				expect( variables.verifyCalls[ 1 ].identity.emailVerified ).toBeFalse()
+			} )
+
+			it( "rejects an iss that isn't the tid's", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft" ), { tid: variables.OTHER_TENANT } ), "profile_failed" )
+			} )
+
+			it( "rejects a token with no tid", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft" ), { tid: "__remove__" } ), "profile_failed" )
+			} )
+
+			it( "rejects the literal templated issuer in a token", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft" ), { iss: "https://login.microsoftonline.com/{tenantid}/v2.0" } ), "profile_failed" )
+			} )
+
+			it( "on common, refuses a discovery document with a concrete issuer", function() {
+				var endpoints = endpointsFor( "microsoft" )
+				var doc = discoveryResponses( endpoints )[ "GET #endpoints.discovery#" ].body
+				doc.issuer = issuerFor( variables.MS_TENANT )
+				var app = buildOidcApp( "microsoft", {}, { "GET #endpoints.discovery#": { body: doc } } )
+				expect( app.inject( "/auth/microsoft" ).header( "Location" ) ).toBe( "/login?error=provider_error" )
+			} )
+
+			it( "on organizations, refuses personal accounts", function() {
+				var app = buildOidcApp( "microsoft", { tenant: "organizations" } )
+				expectOidcSuccess( oidcLogin( app ) )
+				var consumer = buildOidcApp( "microsoft", { tenant: "organizations" } )
+				expectOidcFailure( oidcLogin( consumer, { tid: variables.MS_CONSUMERS, iss: issuerFor( variables.MS_CONSUMERS ) } ), "profile_failed" )
+			} )
+
+			it( "on consumers, takes only personal accounts", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "microsoft", { tenant: "consumers" } ) ) )
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft", { tenant: "consumers" } ), { tid: variables.MS_TENANT, iss: issuerFor( variables.MS_TENANT ) } ), "profile_failed" )
+			} )
+
+			it( "with a tenant id, takes only that tenant", function() {
+				var app = buildOidcApp( "microsoft", { tenant: variables.MS_TENANT } )
+				expect( app.inject( "/auth/microsoft" ).header( "Location" ) ).toInclude( "/#variables.MS_TENANT#/oauth2/v2.0/authorize?" )
+				expectOidcSuccess( oidcLogin( buildOidcApp( "microsoft", { tenant: variables.MS_TENANT } ) ) )
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft", { tenant: variables.MS_TENANT } ), { tid: variables.OTHER_TENANT, iss: issuerFor( variables.OTHER_TENANT ) } ), "profile_failed" )
+			} )
+
+			it( "with a tenant domain, holds tokens to the issuer its discovery names", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "microsoft", { tenant: "contoso.onmicrosoft.com" } ) ) )
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft", { tenant: "contoso.onmicrosoft.com" } ), { tid: variables.OTHER_TENANT, iss: issuerFor( variables.OTHER_TENANT ) } ), "profile_failed" )
+			} )
+
+			it( "with allowedTenants, limits a multi-tenant app to those tenants", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "microsoft", { allowedTenants: [ uCase( variables.MS_TENANT ) ] } ) ) )
+				expectOidcFailure( oidcLogin( buildOidcApp( "microsoft", { allowedTenants: [ variables.OTHER_TENANT ] } ) ), "profile_failed" )
+			} )
+
+			it( "logs out at Microsoft when postLogoutRedirectUrl is set", function() {
+				var app = buildOidcApp( "microsoft", { postLogoutRedirectUrl: "https://tracker.test/" } )
+				var flow = oidcLogin( app )
+				var cookies = structCopy( flow.started.cookies )
+				cookies.append( flow.finished.cookies, true )
+				var response = app.inject( { method: "POST", url: "/auth/logout", cookies: cookies, headers: { "Accept": "text/html" } } )
+				expect( response.header( "Location" ) ).toInclude( "https://login.microsoftonline.com/common/oauth2/v2.0/logout?" )
+			} )
+
+			it( "refuses a tenant or allowedTenants it can't use", function() {
+				var base = { clientId: "c", clientSecret: "s", callbackUrl: "https://tracker.test/auth/microsoft/callback" }
+				for ( var bad in [ "", "not a tenant", "https://login.microsoftonline.com/common", "../common" ] ) {
+					var options = structCopy( base )
+					options.tenant = bad
+					expect( () => boxExpressAuthMicrosoft( options ) ).withContext( bad ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				}
+				var listOptions = structCopy( base )
+				listOptions.allowedTenants = [ "contoso.com" ]
+				expect( () => boxExpressAuthMicrosoft( listOptions ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+		} )
+
+	}
+
+}

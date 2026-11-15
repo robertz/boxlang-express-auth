@@ -10,13 +10,61 @@ class extends="tests.helpers.AuthTestSupport" {
 	variables.GOOGLE_ISSUER = "https://accounts.google.com"
 	variables.GOOGLE_CALLBACK = "https://tracker.test/auth/google/callback"
 	variables.CLIENT_ID = "tracker-client"
+	variables.MS_TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47"
+	variables.MS_CONSUMERS = "9188040d-6c67-4c5b-b112-36a304b66dad"
 
 	function beforeAll() {
 		variables.idp = new tests.helpers.TestIssuer( "test-key-1" )
+		variables.appleKey = new tests.helpers.TestIssuer( "ABC123DEFG", 0, "ES256" )
 		variables.otherIdp = new tests.helpers.TestIssuer( "test-key-1" )
 	}
 
-	function endpointsFor( required string kind ) {
+	function endpointsFor( required string kind, struct providerOptions = {} ) {
+		if ( compare( kind, "microsoft" ) == 0 ) {
+			var tenant = lCase( providerOptions.tenant ?: "common" )
+			var base = "https://login.microsoftonline.com/#tenant#"
+			var multi = [ "common", "organizations" ].find( tenant ) > 0
+			var tokenTenant = compare( tenant, "consumers" ) == 0 ? variables.MS_CONSUMERS : variables.MS_TENANT
+			var docIssuer = multi ? "https://login.microsoftonline.com/{tenantid}/v2.0" : "https://login.microsoftonline.com/#tokenTenant#/v2.0"
+			return {
+				issuer: "https://login.microsoftonline.com/#tokenTenant#/v2.0",
+				docIssuer: docIssuer,
+				discovery: base & "/v2.0/.well-known/openid-configuration",
+				authorize: base & "/oauth2/v2.0/authorize",
+				token: base & "/oauth2/v2.0/token",
+				jwks: base & "/discovery/v2.0/keys",
+				userinfo: "https://graph.microsoft.com/oidc/userinfo",
+				endSession: base & "/oauth2/v2.0/logout",
+				callback: "https://tracker.test/auth/microsoft/callback",
+				name: "microsoft",
+				extraClaims: { tid: tokenTenant }
+			}
+		}
+		if ( compare( kind, "apple" ) == 0 ) {
+			return {
+				issuer: "https://appleid.apple.com",
+				discovery: "https://appleid.apple.com/.well-known/openid-configuration",
+				authorize: "https://appleid.apple.com/auth/authorize",
+				token: "https://appleid.apple.com/auth/token",
+				jwks: "https://appleid.apple.com/auth/keys",
+				userinfo: "",
+				callback: "https://tracker.test/auth/apple/callback",
+				name: "apple"
+			}
+		}
+		if ( compare( kind, "gitlab" ) == 0 ) {
+			var gitlabBase = reReplace( providerOptions.baseUrl ?: "https://gitlab.com", "/+$", "" )
+			return {
+				issuer: gitlabBase,
+				discovery: gitlabBase & "/.well-known/openid-configuration",
+				authorize: gitlabBase & "/oauth/authorize",
+				token: gitlabBase & "/oauth/token",
+				jwks: gitlabBase & "/oauth/discovery/keys",
+				userinfo: gitlabBase & "/oauth/userinfo",
+				callback: "https://tracker.test/auth/gitlab/callback",
+				name: "gitlab"
+			}
+		}
 		if ( compare( kind, "google" ) == 0 ) {
 			return {
 				issuer: variables.GOOGLE_ISSUER,
@@ -36,32 +84,39 @@ class extends="tests.helpers.AuthTestSupport" {
 			token: variables.IDP_ISSUER & "/protocol/openid-connect/token",
 			jwks: variables.IDP_ISSUER & "/protocol/openid-connect/certs",
 			userinfo: variables.IDP_ISSUER & "/protocol/openid-connect/userinfo",
+			endSession: variables.IDP_ISSUER & "/protocol/openid-connect/logout",
 			callback: variables.IDP_CALLBACK,
 			name: "idp"
 		}
 	}
 
 	function discoveryResponses( required struct endpoints ) {
+		var doc = {
+			issuer: endpoints.docIssuer ?: endpoints.issuer,
+			authorization_endpoint: endpoints.authorize,
+			token_endpoint: endpoints.token,
+			jwks_uri: endpoints.jwks,
+			code_challenge_methods_supported: [ "S256" ]
+		}
+		if ( len( endpoints.userinfo ) ) {
+			doc.userinfo_endpoint = endpoints.userinfo
+		}
+		if ( len( endpoints.endSession ?: "" ) ) {
+			doc.end_session_endpoint = endpoints.endSession
+		}
 		return {
-			"GET #endpoints.discovery#": { body: {
-				issuer: endpoints.issuer,
-				authorization_endpoint: endpoints.authorize,
-				token_endpoint: endpoints.token,
-				jwks_uri: endpoints.jwks,
-				userinfo_endpoint: endpoints.userinfo,
-				code_challenge_methods_supported: [ "S256" ]
-			} },
+			"GET #endpoints.discovery#": { body: doc },
 			"GET #endpoints.jwks#": { body: variables.idp.jwks() }
 		}
 	}
 
 	/**
-	 * @kind            "idp" (generic OIDC) or "google"
+	 * @kind            "idp" (generic OIDC), "google", "microsoft", "gitlab" or "apple"
 	 * @providerOptions merged over clientId/clientSecret/callbackUrl (and issuer for idp)
 	 * @responses       replaces scripted responses by key
 	 */
 	function buildOidcApp( string kind = "idp", struct providerOptions = {}, struct responses = {}, struct authOptions = {} ) {
-		variables.endpoints = endpointsFor( kind )
+		variables.endpoints = endpointsFor( kind, providerOptions )
 		var scripted = discoveryResponses( variables.endpoints )
 		scripted.append( responses, true )
 		variables.fake = new tests.helpers.FakeHttpClient( scripted )
@@ -82,16 +137,39 @@ class extends="tests.helpers.AuthTestSupport" {
 			callbackUrl: variables.endpoints.callback,
 			httpClient: variables.fake
 		}
-		if ( compare( kind, "google" ) != 0 ) {
+		if ( compare( kind, "idp" ) == 0 ) {
 			settings.issuer = variables.IDP_ISSUER
 			settings.name = "idp"
+		}
+		if ( compare( kind, "apple" ) == 0 ) {
+			structDelete( settings, "clientSecret" )
+			settings.teamId = "TEAM123456"
+			settings.keyId = variables.appleKey.getKid()
+			settings.privateKey = variables.appleKey.privateKeyPem()
 		}
 		settings.append( providerOptions, true )
 
 		var app = boxExpress()
+		app.use( boxExpressUrlencoded() )
 		app.use( boxExpressSession() )
 		var auth = boxExpressAuth( options )
-		auth.provider( variables.endpoints.name, compare( kind, "google" ) == 0 ? boxExpressAuthGoogle( settings ) : boxExpressAuthOIDC( settings ) )
+		switch ( kind ) {
+			case "apple":
+				variables.provider = boxExpressAuthApple( settings )
+				break
+			case "google":
+				variables.provider = boxExpressAuthGoogle( settings )
+				break
+			case "microsoft":
+				variables.provider = boxExpressAuthMicrosoft( settings )
+				break
+			case "gitlab":
+				variables.provider = boxExpressAuthGitLab( settings )
+				break
+			default:
+				variables.provider = boxExpressAuthOIDC( settings )
+		}
+		auth.provider( variables.endpoints.name, variables.provider )
 		app.use( "/auth", auth.routes() )
 		app.get( "/test/session", ( req, res ) => res.json( { session: req.session } ) )
 		app.use( ( err, req, res, next ) => res.status( 500 ).json( { errorType: err.type ?: "", message: err.message ?: "" } ) )
@@ -101,7 +179,7 @@ class extends="tests.helpers.AuthTestSupport" {
 
 	function standardClaims( required string nonce ) {
 		var now = variables.idp.nowSeconds()
-		return {
+		var claims = {
 			iss: variables.endpoints.issuer,
 			aud: variables.CLIENT_ID,
 			sub: "user-123",
@@ -114,6 +192,8 @@ class extends="tests.helpers.AuthTestSupport" {
 			exp: now + 300,
 			nonce: nonce
 		}
+		claims.append( variables.endpoints.extraClaims ?: {}, true )
+		return claims
 	}
 
 	/**

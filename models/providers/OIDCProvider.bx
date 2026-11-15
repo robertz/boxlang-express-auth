@@ -3,7 +3,7 @@
  * an issuer; it reads the issuer's discovery document on first use, sends a
  * nonce, and validates the returned ID token before building the identity:
  *
- *   - signature, against the issuer's JWKS (RS256/RS384/RS512; the key set
+ *   - signature, against the issuer's JWKS (RS256/384/512 or ES256/384/512; the key set
  *     is cached and refetched once when a token names an unknown kid, which
  *     is how key rotation shows up)
  *   - iss is the configured issuer (or one of acceptedIssuers)
@@ -19,6 +19,13 @@
  * The identity id is the sub claim. When the ID token carries no email and
  * the issuer has a userinfo endpoint, userinfo is read too (userinfo: "auto");
  * its sub must match, and ID-token claims win over userinfo ones.
+ *
+ * Logout at the issuer (RP-initiated logout) is opt-in: set
+ * postLogoutRedirectUrl, and POST /auth/logout sends the browser to the
+ * issuer's end_session_endpoint after ending the local session. The ID
+ * token is only kept in the session as id_token_hint when
+ * logoutIdTokenHint is true; without it the issuer gets client_id, and
+ * most issuers then ask the user to confirm.
  */
 class extends="OAuth2Provider" {
 
@@ -60,6 +67,14 @@ class extends="OAuth2Provider" {
 		}
 		variables.jwt = new "../Jwt"()
 		variables.algorithms = merged.algorithms ?: variables.jwt.supportedAlgorithms()
+		variables.postLogoutRedirectUrl = trim( merged.postLogoutRedirectUrl ?: "" )
+		if ( len( variables.postLogoutRedirectUrl ) && !reFindNoCase( "^https?://", variables.postLogoutRedirectUrl ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "The #providerLabel# provider's postLogoutRedirectUrl must be an absolute http(s) URL — it has to match one registered with the issuer"
+			)
+		}
+		variables.logoutIdTokenHint = ( merged.logoutIdTokenHint ?: false ) == true
 		variables.lockName = "boxexpressauth-oidc-" & createUUID()
 		variables.discovery = {}
 		variables.keySet = { keys: [], fetchedAt: 0 }
@@ -71,7 +86,8 @@ class extends="OAuth2Provider" {
 				authorizeUrl: merged.authorizeUrl,
 				tokenUrl: merged.tokenUrl,
 				jwksUri: merged.jwksUri,
-				userinfoUrl: merged.userinfoUrl ?: ""
+				userinfoUrl: merged.userinfoUrl ?: "",
+				endSessionUrl: merged.endSessionUrl ?: ""
 			}
 		}
 
@@ -119,7 +135,7 @@ class extends="OAuth2Provider" {
 				}
 				// OIDC Discovery 4.3: the document's issuer must be exactly the
 				// one we asked — otherwise it could hand us someone else's keys.
-				if ( compare( doc.issuer ?: "", variables.issuer ) != 0 ) {
+				if ( !isSimpleValue( doc.issuer ?: "" ) || !discoveryIssuerMatches( doc.issuer ?: "" ) ) {
 					throw( type = "BoxExpressAuth.DiscoveryFailed", message = "#this.name# discovery document is for a different issuer" )
 				}
 				for ( var field in [ "authorization_endpoint", "token_endpoint", "jwks_uri" ] ) {
@@ -128,15 +144,76 @@ class extends="OAuth2Provider" {
 					}
 				}
 				var userinfoUrl = isSimpleValue( doc.userinfo_endpoint ?: "" ) && isAllowedEndpoint( doc.userinfo_endpoint ?: "" ) ? doc.userinfo_endpoint : ""
+				var endSessionUrl = isSimpleValue( doc.end_session_endpoint ?: "" ) && isAllowedEndpoint( doc.end_session_endpoint ?: "" ) ? doc.end_session_endpoint : ""
 				variables.discovery = {
+					issuer: doc.issuer,
 					authorizeUrl: doc.authorization_endpoint,
 					tokenUrl: doc.token_endpoint,
 					jwksUri: doc.jwks_uri,
-					userinfoUrl: userinfoUrl
+					userinfoUrl: userinfoUrl,
+					endSessionUrl: endSessionUrl
 				}
 			}
 		}
 		return variables.discovery
+	}
+
+	/**
+	 * OIDC Discovery 4.3: the document's issuer must be exactly the one
+	 * configured. A subclass whose issuer is a template (Microsoft's
+	 * multi-tenant endpoints) overrides this.
+	 */
+	function discoveryIssuerMatches( required string docIssuer ) {
+		return compare( docIssuer, variables.issuer ) == 0
+	}
+
+	/**
+	 * Whether an ID token's iss is acceptable. Exact match against
+	 * acceptedIssuers; overridden where iss depends on other claims.
+	 */
+	function tokenIssuerAllowed( required string tokenIssuer, required struct claims ) {
+		for ( var accepted in variables.acceptedIssuers ) {
+			if ( compare( tokenIssuer, accepted ) == 0 ) {
+				return true
+			}
+		}
+		return false
+	}
+
+	/**
+	 * What Auth keeps in the session at login so logoutUrl() can work
+	 * later: {} unless logout at the issuer is on, and the ID token only
+	 * when logoutIdTokenHint is set.
+	 */
+	function logoutState( required struct tokens ) {
+		if ( !len( variables.postLogoutRedirectUrl ) || !variables.logoutIdTokenHint ) {
+			return {}
+		}
+		var idToken = tokens.idToken ?: ""
+		return isSimpleValue( idToken ) && len( idToken ) ? { idToken: idToken } : {}
+	}
+
+	/**
+	 * The issuer's end-session URL for this user, or "" when logout at the
+	 * issuer is off or the issuer has no end_session_endpoint.
+	 */
+	function logoutUrl( struct logoutState = {} ) {
+		if ( !len( variables.postLogoutRedirectUrl ) ) {
+			return ""
+		}
+		var endpoint = discover().endSessionUrl ?: ""
+		if ( !len( endpoint ) ) {
+			return ""
+		}
+		var params = [
+			[ "client_id", variables.clientId ],
+			[ "post_logout_redirect_uri", variables.postLogoutRedirectUrl ]
+		]
+		var hint = logoutState.idToken ?: ""
+		if ( isSimpleValue( hint ) && len( hint ) ) {
+			params.append( [ "id_token_hint", hint ] )
+		}
+		return endpoint & ( find( "?", endpoint ) ? "&" : "?" ) & encodeQuery( params )
 	}
 
 	function fetchProfile( required struct tokens, struct context = {} ) {
@@ -190,13 +267,7 @@ class extends="OAuth2Provider" {
 
 		var claims = decoded.payload
 		var tokenIssuer = _string( claims.iss ?: "" )
-		var issuerOk = false
-		for ( var accepted in variables.acceptedIssuers ) {
-			if ( compare( tokenIssuer, accepted ) == 0 ) {
-				issuerOk = true
-			}
-		}
-		if ( !issuerOk ) {
+		if ( !tokenIssuerAllowed( tokenIssuer, claims ) ) {
 			_reject( "is from a different issuer" )
 		}
 
@@ -239,7 +310,7 @@ class extends="OAuth2Provider" {
 		for ( var attempt = 1; attempt <= 2; attempt++ ) {
 			var candidates = signingKeys( kid, alg, attempt == 2 )
 			for ( var jwk in candidates ) {
-				if ( variables.jwt.verifyRsa( decoded, jwk, alg ) ) {
+				if ( variables.jwt.verify( decoded, jwk, alg ) ) {
 					return true
 				}
 			}
@@ -255,9 +326,10 @@ class extends="OAuth2Provider" {
 	function signingKeys( required string kid, required string alg, boolean refresh = false ) {
 		var wantKid = kid
 		var wantAlg = alg
+		var wantKty = variables.jwt.keyTypeFor( alg )
 		var keys = jwks( refresh )
 		return keys.filter( ( jwk ) => isStruct( jwk )
-			&& compare( jwk.kty ?: "", "RSA" ) == 0
+			&& compare( jwk.kty ?: "", wantKty ) == 0
 			&& ( !structKeyExists( jwk, "use" ) || compare( jwk.use, "sig" ) == 0 )
 			&& ( !structKeyExists( jwk, "alg" ) || compare( jwk.alg, wantAlg ) == 0 )
 			&& ( !len( wantKid ) || compare( jwk.kid ?: "", wantKid ) == 0 ) )

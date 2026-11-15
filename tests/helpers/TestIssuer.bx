@@ -1,15 +1,31 @@
 /**
- * A pretend OpenID Provider for specs: an RSA key pair, its JWKS, and
- * signed ID tokens — so ID-token validation is tested against real RS256
- * signatures without any network.
+ * A pretend OpenID Provider for specs: an RSA or EC key pair, its JWKS,
+ * and signed ID tokens — so ID-token validation is tested against real
+ * RS256/ES256 signatures without any network.
+ *
+ *   new TestIssuer( "k1" )                      RSA 2048, signs RS256
+ *   new TestIssuer( "k1", 0, "ES256" )          P-256, signs ES256
  */
 class {
 
-	function init( string kid = "test-key-1", numeric bits = 2048 ) {
+	variables.EC = {
+		"ES256": { curve: "secp256r1", crv: "P-256", bytes: 32, java: "SHA256withECDSAinP1363Format" },
+		"ES384": { curve: "secp384r1", crv: "P-384", bytes: 48, java: "SHA384withECDSAinP1363Format" },
+		"ES512": { curve: "secp521r1", crv: "P-521", bytes: 66, java: "SHA512withECDSAinP1363Format" }
+	}
+
+	function init( string kid = "test-key-1", numeric bits = 2048, string alg = "RS256" ) {
 		variables.kid = kid
-		var generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "RSA" )
-		generator.initialize( javacast( "int", bits ) )
-		variables.keyPair = generator.generateKeyPair()
+		variables.alg = alg
+		if ( structKeyExists( variables.EC, alg ) ) {
+			var ecGenerator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "EC" )
+			ecGenerator.initialize( createObject( "java", "java.security.spec.ECGenParameterSpec" ).init( variables.EC[ alg ].curve ) )
+			variables.keyPair = ecGenerator.generateKeyPair()
+		} else {
+			var generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "RSA" )
+			generator.initialize( javacast( "int", bits ) )
+			variables.keyPair = generator.generateKeyPair()
+		}
 		variables.encoder = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
 		return this
 	}
@@ -20,6 +36,19 @@ class {
 
 	function jwk() {
 		var publicKey = variables.keyPair.getPublic()
+		if ( structKeyExists( variables.EC, variables.alg ) ) {
+			var spec = variables.EC[ variables.alg ]
+			var point = publicKey.getW()
+			return {
+				kty: "EC",
+				use: "sig",
+				alg: variables.alg,
+				kid: variables.kid,
+				crv: spec.crv,
+				x: variables.encoder.encodeToString( _fixed( point.getAffineX().toByteArray(), spec.bytes ) ),
+				y: variables.encoder.encodeToString( _fixed( point.getAffineY().toByteArray(), spec.bytes ) )
+			}
+		}
 		return {
 			kty: "RSA",
 			use: "sig",
@@ -30,6 +59,14 @@ class {
 		}
 	}
 
+	/**
+	 * The private key as a PKCS#8 PEM — the shape of Apple's .p8 files.
+	 */
+	function privateKeyPem() {
+		var body = createObject( "java", "java.util.Base64" ).getMimeEncoder( javacast( "int", 64 ), charsetDecode( char( 10 ), "US-ASCII" ) ).encodeToString( variables.keyPair.getPrivate().getEncoded() )
+		return "-----BEGIN PRIVATE KEY-----" & char( 10 ) & body & char( 10 ) & "-----END PRIVATE KEY-----" & char( 10 )
+	}
+
 	function jwks() {
 		return { keys: [ jwk() ] }
 	}
@@ -38,8 +75,11 @@ class {
 	 * @header merged over { alg: "RS256", typ: "JWT", kid }
 	 * @javaAlgorithm what actually signs, so a spec can lie in the header
 	 */
-	function sign( required struct claims, struct header = {}, string javaAlgorithm = "SHA256withRSA" ) {
-		var fullHeader = { alg: "RS256", typ: "JWT", kid: variables.kid }
+	function sign( required struct claims, struct header = {}, string javaAlgorithm = "" ) {
+		if ( !len( javaAlgorithm ) ) {
+			javaAlgorithm = structKeyExists( variables.EC, variables.alg ) ? variables.EC[ variables.alg ].java : "SHA256withRSA"
+		}
+		var fullHeader = { alg: variables.alg, typ: "JWT", kid: variables.kid }
 		fullHeader.append( header, true )
 		var signingInput = _segment( jsonSerialize( fullHeader ) ) & "." & _segment( jsonSerialize( claims ) )
 		var signer = createObject( "java", "java.security.Signature" ).getInstance( javaAlgorithm )
@@ -60,6 +100,20 @@ class {
 
 	function _segment( required string text ) {
 		return variables.encoder.encodeToString( charsetDecode( text, "UTF-8" ) )
+	}
+
+	/**
+	 * An EC coordinate as exactly size big-endian bytes (JWK and JWS both
+	 * want the curve's full width, left-padded with zeros).
+	 */
+	function _fixed( bytes, required numeric size ) {
+		var raw = _unsigned( bytes )
+		var out = createObject( "java", "java.io.ByteArrayOutputStream" ).init()
+		for ( var i = arrayLen( raw ); i < size; i++ ) {
+			out.write( javacast( "int", 0 ) )
+		}
+		out.write( raw, javacast( "int", 0 ), javacast( "int", arrayLen( raw ) ) )
+		return out.toByteArray()
 	}
 
 	/**

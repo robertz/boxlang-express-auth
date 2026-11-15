@@ -1,7 +1,8 @@
 /**
  * Just enough JWS to verify an OIDC ID token: split and decode a compact
- * JWT, and check an RS256/RS384/RS512 signature against an RSA JWK. Not a
- * general JWT library — no encryption, no HMAC, no "none", no creation.
+ * JWT, and check an RS256/384/512 signature against an RSA JWK or an
+ * ES256/384/512 signature against an EC JWK. Not a general JWT library —
+ * no encryption, no HMAC, no "none", no creation.
  */
 class {
 
@@ -11,6 +12,14 @@ class {
 		"RS512": "SHA512withRSA"
 	}
 	variables.MIN_RSA_BITS = 2048
+	// JWS (RFC 7518 3.4) pins each ES algorithm to one curve, and carries
+	// the signature as raw R||S rather than DER — the P1363 variants read
+	// that format directly.
+	variables.EC_ALGORITHMS = {
+		"ES256": { java: "SHA256withECDSAinP1363Format", crv: "P-256", curve: "secp256r1", bytes: 32 },
+		"ES384": { java: "SHA384withECDSAinP1363Format", crv: "P-384", curve: "secp384r1", bytes: 48 },
+		"ES512": { java: "SHA512withECDSAinP1363Format", crv: "P-521", curve: "secp521r1", bytes: 66 }
+	}
 
 	function init() {
 		variables.decoder = createObject( "java", "java.util.Base64" ).getUrlDecoder()
@@ -18,7 +27,35 @@ class {
 	}
 
 	function supportedAlgorithms() {
-		return structKeyArray( variables.RSA_ALGORITHMS )
+		var names = structKeyArray( variables.RSA_ALGORITHMS )
+		names.append( structKeyArray( variables.EC_ALGORITHMS ), true )
+		return names
+	}
+
+	/**
+	 * The JWK kty an algorithm needs ("RSA", "EC"), or "" for one this
+	 * class doesn't verify.
+	 */
+	function keyTypeFor( required string alg ) {
+		if ( structKeyExists( variables.RSA_ALGORITHMS, alg ) ) {
+			return "RSA"
+		}
+		return structKeyExists( variables.EC_ALGORITHMS, alg ) ? "EC" : ""
+	}
+
+	/**
+	 * True only for a valid signature by this key under this algorithm;
+	 * anything else — wrong key type, wrong curve, unknown alg — is false.
+	 */
+	function verify( required struct decoded, required struct jwk, required string alg ) {
+		var keyType = keyTypeFor( alg )
+		if ( compare( keyType, "RSA" ) == 0 ) {
+			return verifyRsa( decoded, jwk, alg )
+		}
+		if ( compare( keyType, "EC" ) == 0 ) {
+			return verifyEc( decoded, jwk, alg )
+		}
+		return false
 	}
 
 	/**
@@ -65,6 +102,39 @@ class {
 			var keySpec = createObject( "java", "java.security.spec.RSAPublicKeySpec" ).init( modulus, exponent )
 			var publicKey = createObject( "java", "java.security.KeyFactory" ).getInstance( "RSA" ).generatePublic( keySpec )
 			var verifier = createObject( "java", "java.security.Signature" ).getInstance( variables.RSA_ALGORITHMS[ alg ] )
+			verifier.initVerify( publicKey )
+			verifier.update( charsetDecode( decoded.signingInput, "US-ASCII" ) )
+			return verifier.verify( decoded.signature )
+		} catch ( any e ) {
+			return false
+		}
+	}
+
+	/**
+	 * True only for a valid signature by this EC key. The key's crv must be
+	 * the one the algorithm names, and the signature exactly R||S at that
+	 * curve's size.
+	 */
+	function verifyEc( required struct decoded, required struct jwk, required string alg ) {
+		if ( !structKeyExists( variables.EC_ALGORITHMS, alg ) || compare( jwk.kty ?: "", "EC" ) != 0 ) {
+			return false
+		}
+		var spec = variables.EC_ALGORITHMS[ alg ]
+		if ( compare( jwk.crv ?: "", spec.crv ) != 0 || arrayLen( decoded.signature ) != spec.bytes * 2 ) {
+			return false
+		}
+		try {
+			var bigInteger = createObject( "java", "java.math.BigInteger" )
+			var point = createObject( "java", "java.security.spec.ECPoint" ).init(
+				bigInteger.init( javacast( "int", 1 ), variables.decoder.decode( jwk.x ) ),
+				bigInteger.init( javacast( "int", 1 ), variables.decoder.decode( jwk.y ) )
+			)
+			var parameters = createObject( "java", "java.security.AlgorithmParameters" ).getInstance( "EC" )
+			parameters.init( createObject( "java", "java.security.spec.ECGenParameterSpec" ).init( spec.curve ) )
+			var curveSpec = parameters.getParameterSpec( createObject( "java", "java.lang.Class" ).forName( "java.security.spec.ECParameterSpec" ) )
+			var keySpec = createObject( "java", "java.security.spec.ECPublicKeySpec" ).init( point, curveSpec )
+			var publicKey = createObject( "java", "java.security.KeyFactory" ).getInstance( "EC" ).generatePublic( keySpec )
+			var verifier = createObject( "java", "java.security.Signature" ).getInstance( spec.java )
 			verifier.initVerify( publicKey )
 			verifier.update( charsetDecode( decoded.signingInput, "US-ASCII" ) )
 			return verifier.verify( decoded.signature )

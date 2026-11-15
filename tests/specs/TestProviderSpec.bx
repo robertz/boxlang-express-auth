@@ -1,0 +1,117 @@
+/**
+ * boxExpressAuthTestProvider(): an app's own specs logging in through the
+ * real /auth routes without a provider account or any network.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function buildTestApp( struct providerOptions = {}, struct authOptions = {} ) {
+		variables.verifyCalls = []
+		var seen = variables.verifyCalls
+		var options = {
+			verify: ( identity, tokens, req ) => {
+				seen.append( { identity: identity, tokens: tokens } )
+				return { id: "user-" & identity.id }
+			}
+		}
+		options.append( authOptions, true )
+		var app = boxExpress()
+		app.use( boxExpressSession() )
+		variables.testLogin = boxExpressAuthTestProvider( providerOptions )
+		var auth = boxExpressAuth( options )
+		auth.provider( variables.testLogin.name, variables.testLogin )
+		app.use( "/auth", auth.routes() )
+		app.get( "/dashboard", auth.required(), ( req, res ) => res.json( { user: req.user } ) )
+		return app
+	}
+
+	function run() {
+
+		describe( "The test provider", function() {
+
+			it( "logs in as its default identity and leaves a usable session", function() {
+				var app = buildTestApp()
+				var login = variables.testLogin.login( app )
+				expect( login.response.statusCode ).toBe( 302 )
+				expect( login.location ).toBe( "/" )
+				expect( variables.verifyCalls ).toHaveLength( 1 )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.provider ).toBe( "test" )
+				expect( identity.id ).toBe( "test-user" )
+				expect( identity.email ).toBe( "test@example.com" )
+				expect( identity.emailVerified ).toBeTrue()
+				var me = app.inject( { url: "/dashboard", cookies: login.cookies } )
+				expect( me.statusCode ).toBe( 200 )
+				expect( me.json().user.id ).toBe( "user-test-user" )
+			} )
+
+			it( "takes a default identity at construction and a different one per login", function() {
+				var app = buildTestApp( { identity: { id: "ada", email: "ada@example.com" } } )
+				variables.testLogin.login( app )
+				variables.testLogin.login( app, { identity: { id: "grace", emailVerified: false } } )
+				expect( variables.verifyCalls[ 1 ].identity.id ).toBe( "ada" )
+				expect( variables.verifyCalls[ 2 ].identity.id ).toBe( "grace" )
+				expect( variables.verifyCalls[ 2 ].identity.email ).toBe( "ada@example.com" )
+				expect( variables.verifyCalls[ 2 ].identity.emailVerified ).toBeFalse()
+			} )
+
+			it( "follows returnTo, through the same checks as a real login", function() {
+				var app = buildTestApp()
+				expect( variables.testLogin.login( app, { returnTo: "/settings?tab=2" } ).location ).toBe( "/settings?tab=2" )
+				expect( variables.testLogin.login( app, { returnTo: "//evil.test" } ).location ).toBe( "/" )
+			} )
+
+			it( "simulates the user refusing", function() {
+				var app = buildTestApp()
+				var login = variables.testLogin.login( app, { deny: "access_denied" } )
+				expect( login.location ).toBe( "/login?error=access_denied" )
+				expect( variables.verifyCalls ).toBeEmpty()
+			} )
+
+			it( "simulates the token exchange or the profile failing", function() {
+				var app = buildTestApp()
+				expect( variables.testLogin.login( app, { fail: "token_exchange_failed" } ).location ).toBe( "/login?error=token_exchange_failed" )
+				expect( variables.testLogin.login( app, { fail: "profile_failed" } ).location ).toBe( "/login?error=profile_failed" )
+				expect( () => variables.testLogin.login( app, { fail: "nonsense" } ) ).toThrow( "BoxExpressAuth.InvalidArgument" )
+			} )
+
+			it( "redirects GET /auth/test to a host that can never resolve", function() {
+				var app = buildTestApp()
+				var location = app.inject( "/auth/test" ).header( "Location" )
+				expect( location ).toMatch( "^https://auth\.test\.invalid/authorize\?" )
+			} )
+
+			it( "won't approve anything but its own authorize URL", function() {
+				buildTestApp()
+				expect( () => variables.testLogin.approve( "https://github.com/login/oauth/authorize?state=x" ) ).toThrow( "BoxExpressAuth.InvalidArgument" )
+			} )
+
+			it( "accepts each code once, and only with the matching PKCE verifier", function() {
+				var app = buildTestApp()
+				var location = app.inject( "/auth/test" ).header( "Location" )
+				var callbackTarget = variables.testLogin.approve( location )
+				var code = createObject( "java", "java.net.URLDecoder" ).decode( reReplace( callbackTarget, "^.*[?&]code=([^&]+).*$", "\1" ), "UTF-8" )
+				expect( () => variables.testLogin.exchangeCode( code, "not-the-verifier", variables.testLogin.callbackUrl ) ).toThrow( "BoxExpressAuth.TokenExchangeFailed" )
+				expect( () => variables.testLogin.exchangeCode( code, "not-the-verifier", variables.testLogin.callbackUrl ) ).toThrow( "BoxExpressAuth.TokenExchangeFailed" )
+			} )
+
+			it( "answers on the path its callbackUrl names", function() {
+				var app = boxExpress()
+				app.use( boxExpressSession() )
+				var testLogin = boxExpressAuthTestProvider( { name: "staff", callbackUrl: "http://localhost/login/staff/callback" } )
+				var auth = boxExpressAuth( { verify: ( identity ) => { return { id: identity.id } } } )
+				auth.provider( "staff", testLogin )
+				app.use( "/login", auth.routes() )
+				expect( testLogin.startPath() ).toBe( "/login/staff" )
+				expect( testLogin.login( app ).response.statusCode ).toBe( 302 )
+				expect( testLogin.login( app ).location ).toBe( "/" )
+			} )
+
+			it( "needs a callbackUrl ending in /callback", function() {
+				expect( () => boxExpressAuthTestProvider( { callbackUrl: "/auth/test/callback" } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+		} )
+
+	}
+
+}

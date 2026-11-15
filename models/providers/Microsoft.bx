@@ -1,0 +1,134 @@
+/**
+ * Microsoft sign-in (Entra ID, the v2.0 endpoints): OIDCProvider pointed at
+ * login.microsoftonline.com, with the tenant handling a preset should hide.
+ *
+ * tenant decides who may sign in:
+ *   "common"         any work/school account or personal Microsoft account
+ *   "organizations"  any work/school account, no personal accounts
+ *   "consumers"      personal Microsoft accounts only
+ *   a tenant id      that one tenant (a GUID, or its verified domain such
+ *                    as "contoso.onmicrosoft.com")
+ *
+ * The multi-tenant endpoints publish a templated issuer
+ * ("https://login.microsoftonline.com/{tenantid}/v2.0"), and every ID token
+ * carries its own tenant's iss. So iss is checked against the token's tid
+ * claim, tid against the tenant setting, and against allowedTenants when
+ * that is set — which is how a multi-tenant app limits sign-in to the
+ * tenants it has onboarded.
+ *
+ * Microsoft's email claim isn't verified by Microsoft (any tenant admin
+ * can set it), so identity.emailVerified is always false. Key users on
+ * identity.id (the sub claim); identity.tenantId is the tid.
+ */
+class extends="OIDCProvider" {
+
+	variables.AUTHORITY = "https://login.microsoftonline.com"
+	variables.CONSUMERS_TENANT = "9188040d-6c67-4c5b-b112-36a304b66dad"
+	variables.GUID_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+	function init( struct options = {} ) {
+		variables.tenant = lCase( trim( options.tenant ?: "common" ) )
+		variables.tenantKind = _tenantKind( variables.tenant )
+		if ( !len( variables.tenantKind ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "The microsoft provider's tenant must be common, organizations, consumers, a tenant id, or a tenant's domain"
+			)
+		}
+		var allowed = options.allowedTenants ?: []
+		if ( !isArray( allowed ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The microsoft provider's allowedTenants must be an array of tenant ids" )
+		}
+		variables.allowedTenants = []
+		for ( var tenantId in allowed ) {
+			if ( !isSimpleValue( tenantId ) || !reFind( variables.GUID_PATTERN, lCase( tenantId ) ) ) {
+				throw( type = "BoxExpressAuth.InvalidProvider", message = "The microsoft provider's allowedTenants must be tenant ids (GUIDs)" )
+			}
+			variables.allowedTenants.append( lCase( tenantId ) )
+		}
+		return super.init( options, {
+			name: "microsoft",
+			issuer: "#variables.AUTHORITY#/#variables.tenant#/v2.0",
+			userinfo: "never"
+		} )
+	}
+
+	function discoveryIssuerMatches( required string docIssuer ) {
+		switch ( variables.tenantKind ) {
+			case "multi":
+				return compare( docIssuer, "#variables.AUTHORITY#/{tenantid}/v2.0" ) == 0
+			case "consumers":
+				return compare( docIssuer, _issuerFor( variables.CONSUMERS_TENANT ) ) == 0
+			case "id":
+				return compare( docIssuer, _issuerFor( variables.tenant ) ) == 0
+			default:
+				// A domain resolves to its tenant's GUID issuer; tokens are
+				// then held to exactly that one.
+				return len( _tenantFromIssuer( docIssuer ) ) > 0
+		}
+	}
+
+	function tokenIssuerAllowed( required string tokenIssuer, required struct claims ) {
+		var tid = lCase( _string( claims.tid ?: "" ) )
+		if ( !reFind( variables.GUID_PATTERN, tid ) || compare( tokenIssuer, _issuerFor( tid ) ) != 0 ) {
+			return false
+		}
+		var tenantOk = false
+		switch ( variables.tenantKind ) {
+			case "multi":
+				tenantOk = compare( variables.tenant, "organizations" ) != 0 || compare( tid, variables.CONSUMERS_TENANT ) != 0
+				break
+			case "consumers":
+				tenantOk = compare( tid, variables.CONSUMERS_TENANT ) == 0
+				break
+			case "id":
+				tenantOk = compare( tid, variables.tenant ) == 0
+				break
+			default:
+				tenantOk = compare( tokenIssuer, discover().issuer ?: "" ) == 0
+		}
+		if ( !tenantOk ) {
+			return false
+		}
+		return !arrayLen( variables.allowedTenants ) || variables.allowedTenants.find( tid ) > 0
+	}
+
+	function identityFromClaims( required struct claims ) {
+		var identity = super.identityFromClaims( claims )
+		identity.emailVerified = false
+		identity.tenantId = lCase( _string( claims.tid ?: "" ) )
+		return identity
+	}
+
+	function getTenant() {
+		return variables.tenant
+	}
+
+	function _tenantKind( required string value ) {
+		if ( [ "common", "organizations" ].find( value ) ) {
+			return "multi"
+		}
+		if ( compare( value, "consumers" ) == 0 ) {
+			return "consumers"
+		}
+		if ( reFind( variables.GUID_PATTERN, value ) ) {
+			return "id"
+		}
+		return reFind( "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", value ) ? "domain" : ""
+	}
+
+	function _issuerFor( required string tenantId ) {
+		return "#variables.AUTHORITY#/#tenantId#/v2.0"
+	}
+
+	function _tenantFromIssuer( required string candidate ) {
+		var prefix = variables.AUTHORITY & "/"
+		var suffix = "/v2.0"
+		if ( len( candidate ) != len( prefix ) + 36 + len( suffix ) || compare( mid( candidate, 1, len( prefix ) ), prefix ) != 0 ) {
+			return ""
+		}
+		var tenantId = mid( candidate, len( prefix ) + 1, 36 )
+		return reFind( variables.GUID_PATTERN, tenantId ) && compare( candidate, _issuerFor( tenantId ) ) == 0 ? tenantId : ""
+	}
+
+}

@@ -1,0 +1,189 @@
+/**
+ * Sign in with Apple: OIDCProvider pointed at appleid.apple.com, with the
+ * three things Apple does differently.
+ *
+ * 1. The client secret is a JWT, not a string. The app signs it (ES256)
+ *    with the .p8 key Apple issued; a fresh one, valid for five minutes, is
+ *    minted for every code exchange. Options: clientId (the Services ID),
+ *    teamId, keyId, privateKey (the .p8 file's text).
+ *
+ * 2. Asking for name or email makes Apple return the user with a
+ *    cross-site form POST (response_mode=form_post). Auth's
+ *    POST /:provider/callback turns that into the usual GET callback; see
+ *    Auth.handleFormPostCallback().
+ *
+ * 3. The user's name is never in the ID token. Apple posts it as a `user`
+ *    JSON field — once, on the user's first authorization of the app. It
+ *    is held here, keyed by a hash of the login's state, until the GET
+ *    callback picks it up (or 10 minutes pass). That hold is in this
+ *    process's memory: with several app instances and no sticky sessions,
+ *    the name can be lost. The email always comes from the signed ID
+ *    token, never from that unsigned field.
+ *
+ * identity.id is Apple's sub (stable per developer team). identity.email
+ * may be a private relay address; identity.isPrivateEmail says so.
+ */
+class extends="OIDCProvider" {
+
+	variables.APPLE_ISSUER = "https://appleid.apple.com"
+	variables.HANDOFF_TTL_MS = 10 * 60 * 1000
+	variables.HANDOFF_MAX = 1000
+	variables.SECRET_TTL_SECONDS = 300
+
+	function init( struct options = {} ) {
+		for ( var field in [ "teamId", "keyId" ] ) {
+			if ( !isSimpleValue( options[ field ] ?: "" ) || !reFind( "^[A-Z0-9]{10}$", options[ field ] ?: "" ) ) {
+				throw(
+					type = "BoxExpressAuth.InvalidProvider",
+					message = "The apple provider needs #field#: the 10-character id from your Apple developer account"
+				)
+			}
+		}
+		variables.teamId = options.teamId
+		variables.keyId = options.keyId
+		variables.signingKey = _loadPrivateKey( options.privateKey ?: "" )
+
+		// Apple's scopes are "name" and "email"; the ID token comes back
+		// without asking for openid. OIDCProvider's own check still sees it.
+		variables.appleScopes = options.scopes ?: [ "name", "email" ]
+		if ( !isArray( variables.appleScopes ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The apple provider's scopes must be an array" )
+		}
+		var appleOptions = structCopy( options )
+		appleOptions.scopes = [ "openid" ]
+		appleOptions.clientSecret = "minted-per-exchange"
+
+		variables.handoff = {}
+		variables.handoffLock = "boxexpressauth-apple-" & createUUID()
+
+		super.init( appleOptions, {
+			name: "apple",
+			issuer: variables.APPLE_ISSUER,
+			userinfo: "never"
+		} )
+		variables.scopes = variables.appleScopes.filter( ( scope ) => compare( scope, "openid" ) != 0 )
+		return this
+	}
+
+	/**
+	 * form_post whenever a scope is requested — Apple refuses name or
+	 * email with any other response mode. With scopes: [] Apple answers
+	 * with an ordinary GET callback and no form post at all.
+	 */
+	function authorizationParams( string nonce = "" ) {
+		var params = super.authorizationParams( nonce )
+		if ( arrayLen( variables.scopes ) ) {
+			params.append( [ "response_mode", "form_post" ] )
+		}
+		return params
+	}
+
+	/**
+	 * The client_secret JWT (Apple: "Creating a client secret"), signed
+	 * ES256 with the team's key.
+	 */
+	function clientSecretValue() {
+		var now = javacast( "long", variables.crypto.nowMs() / 1000 )
+		var header = { alg: "ES256", kid: variables.keyId, typ: "JWT" }
+		var claims = {
+			iss: variables.teamId,
+			iat: now,
+			exp: now + variables.SECRET_TTL_SECONDS,
+			aud: variables.APPLE_ISSUER,
+			sub: variables.clientId
+		}
+		var encoder = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
+		var signingInput = encoder.encodeToString( charsetDecode( jsonSerialize( header ), "UTF-8" ) )
+			& "." & encoder.encodeToString( charsetDecode( jsonSerialize( claims ), "UTF-8" ) )
+		var signer = createObject( "java", "java.security.Signature" ).getInstance( "SHA256withECDSAinP1363Format" )
+		signer.initSign( variables.signingKey )
+		signer.update( charsetDecode( signingInput, "US-ASCII" ) )
+		return signingInput & "." & encoder.encodeToString( signer.sign() )
+	}
+
+	/**
+	 * Apple's form post → the code/state/error for the GET callback. The
+	 * name from `user` is held for fetchProfile(); its email and the
+	 * posted id_token are ignored (both unverified at this point).
+	 */
+	function acceptFormPost( required struct fields ) {
+		var state = _string( fields.state ?: "" )
+		var error = _string( fields.error ?: "" )
+		if ( compare( error, "user_cancelled_authorize" ) == 0 ) {
+			error = "access_denied"
+		}
+		var userJson = _string( fields.user ?: "" )
+		if ( len( state ) && len( userJson ) && len( userJson ) <= 4096 && isJSON( userJson ) ) {
+			var posted = jsonDeserialize( userJson )
+			var postedName = isStruct( posted ) && isStruct( posted.name ?: "" ) ? posted.name : {}
+			var fullName = trim( _string( postedName.firstName ?: "" ) & " " & _string( postedName.lastName ?: "" ) )
+			if ( len( fullName ) ) {
+				_holdName( state, left( fullName, 200 ) )
+			}
+		}
+		return { code: _string( fields.code ?: "" ), state: state, error: error }
+	}
+
+	function fetchProfile( required struct tokens, struct context = {} ) {
+		var identity = super.fetchProfile( tokens, context )
+		var heldName = _takeName( context.state ?: "" )
+		if ( !len( identity.name ) && len( heldName ) ) {
+			identity.name = heldName
+		}
+		identity.isPrivateEmail = _isTrue( identity.raw.is_private_email ?: false )
+		return identity
+	}
+
+	function _holdName( required string state, required string fullName ) {
+		var key = variables.crypto.s256( state )
+		var now = variables.crypto.nowMs()
+		lock name=variables.handoffLock type="exclusive" timeout=5 {
+			for ( var held in structKeyArray( variables.handoff ) ) {
+				if ( variables.handoff[ held ].expiresAt < now ) {
+					structDelete( variables.handoff, held )
+				}
+			}
+			// Anyone can post here, so the hold is bounded: past the cap a
+			// name is dropped (the login still works, just without it).
+			if ( structCount( variables.handoff ) < variables.HANDOFF_MAX ) {
+				variables.handoff[ key ] = { name: fullName, expiresAt: now + variables.HANDOFF_TTL_MS }
+			}
+		}
+	}
+
+	function _takeName( required string state ) {
+		if ( !len( state ) ) {
+			return ""
+		}
+		var key = variables.crypto.s256( state )
+		var held = ""
+		lock name=variables.handoffLock type="exclusive" timeout=5 {
+			held = variables.handoff[ key ] ?: ""
+			structDelete( variables.handoff, key )
+		}
+		return isStruct( held ) && held.expiresAt >= variables.crypto.nowMs() ? held.name : ""
+	}
+
+	/**
+	 * The .p8 file Apple issues: a PKCS#8 PEM EC key on P-256. Errors never
+	 * include any of the key's text.
+	 */
+	function _loadPrivateKey( required any pem ) {
+		var invalid = "The apple provider's privateKey must be the text of the .p8 key Apple issued (PKCS##8 PEM, P-256)"
+		if ( !isSimpleValue( pem ) || !find( "BEGIN PRIVATE KEY", pem ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = invalid )
+		}
+		try {
+			var body = reReplace( reReplace( pem, "-----(BEGIN|END) PRIVATE KEY-----", "", "all" ), "\s", "", "all" )
+			var keySpec = createObject( "java", "java.security.spec.PKCS8EncodedKeySpec" ).init( createObject( "java", "java.util.Base64" ).getDecoder().decode( body ) )
+			var privateKey = createObject( "java", "java.security.KeyFactory" ).getInstance( "EC" ).generatePrivate( keySpec )
+			if ( privateKey.getParams().getCurve().getField().getFieldSize() != 256 ) {
+				throw( type = "BoxExpressAuth.InvalidProvider", message = invalid )
+			}
+			return privateKey
+		} catch ( any e ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = invalid )
+		}
+	}
+
+}

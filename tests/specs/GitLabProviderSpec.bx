@@ -1,0 +1,42 @@
+/**
+ * The GitLab preset: gitlab.com by default, a self-managed instance
+ * through baseUrl.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	function run() {
+
+		describe( "GitLab", function() {
+
+			it( "uses gitlab.com's endpoints and logs in with the GitLab username", function() {
+				var app = buildOidcApp( "gitlab" )
+				var flow = oidcLogin( app, { preferred_username: "ada.lovelace" } )
+				expect( flow.location ).toInclude( "https://gitlab.com/oauth/authorize?" )
+				expectOidcSuccess( flow )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.provider ).toBe( "gitlab" )
+				expect( identity.username ).toBe( "ada.lovelace" )
+				expect( identity.emailVerified ).toBeTrue()
+			} )
+
+			it( "falls back to nickname for the username", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "gitlab" ), { preferred_username: "__remove__", nickname: "ada" } ) )
+				expect( variables.verifyCalls[ 1 ].identity.username ).toBe( "ada" )
+			} )
+
+			it( "points at a self-managed instance through baseUrl", function() {
+				var app = buildOidcApp( "gitlab", { baseUrl: "https://git.example.com/" } )
+				var flow = oidcLogin( app )
+				expect( flow.location ).toInclude( "https://git.example.com/oauth/authorize?" )
+				expectOidcSuccess( flow )
+			} )
+
+			it( "rejects a token from gitlab.com on a self-managed instance", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "gitlab", { baseUrl: "https://git.example.com" } ), { iss: "https://gitlab.com" } ), "profile_failed" )
+			} )
+
+		} )
+
+	}
+
+}

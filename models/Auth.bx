@@ -20,9 +20,18 @@
  *     the callback before anything else is checked.
  *   userId = "<what verify() returned as id>"
  *     after a successful login, in a freshly regenerated session.
+ *   provider = "<registered name>"
+ *     which provider that login came through.
+ *   logout = { idToken }
+ *     only for an OIDC provider with postLogoutRedirectUrl and
+ *     logoutIdTokenHint set, so POST /logout can send id_token_hint.
  *
- * Provider tokens are never stored: verify() gets them, then they go out
- * of scope with the request.
+ * Provider access tokens are never stored: verify() gets them, then they go
+ * out of scope with the request.
+ *
+ * With a link( identity, user, tokens, req ) option, a signed-in user can
+ * also POST /auth/<name>/link to attach another provider account to the
+ * account they're signed in as; see handleLinkStart().
  *
  * Every function a route closure calls is public on purpose — BoxLang can't
  * reach a private method from a closure the router invokes later.
@@ -36,7 +45,8 @@ class {
 		"expired_state",
 		"token_exchange_failed",
 		"profile_failed",
-		"login_denied"
+		"login_denied",
+		"link_denied"
 	]
 	variables.RESERVED_NAMES = [ "logout" ]
 
@@ -51,11 +61,18 @@ class {
 			throw( type = "BoxExpressAuth.InvalidConfig", message = "boxExpressAuth() loadUser must be a function( id )" )
 		}
 
+		if ( structKeyExists( options, "link" ) && !isCustomFunction( options.link ) && !isClosure( options.link ) ) {
+			throw( type = "BoxExpressAuth.InvalidConfig", message = "boxExpressAuth() link must be a function( identity, user, tokens, req )" )
+		}
+
 		variables.verifyFn = options.verify
+		variables.linkFn = options.link ?: ""
 		variables.loadUserFn = options.loadUser ?: ""
 		variables.successRedirect = options.successRedirect ?: "/"
 		variables.failureRedirect = options.failureRedirect ?: "/login"
 		variables.loginPath = options.loginPath ?: "/login"
+		variables.linkRedirect = options.linkRedirect ?: variables.successRedirect
+		variables.linkFailureRedirect = options.linkFailureRedirect ?: variables.failureRedirect
 		variables.sessionKey = options.sessionKey ?: "auth"
 		variables.stateTtlMs = ( options.stateTtlSeconds ?: 600 ) * 1000
 		variables.providers = {}
@@ -87,17 +104,34 @@ class {
 	}
 
 	/**
-	 * GET /:provider, GET /:provider/callback and POST /logout, as a router
-	 * to mount wherever the provider callbackUrls point (usually /auth).
+	 * GET /:provider, GET /:provider/callback, POST /:provider/link and
+	 * POST /logout, as a router to mount wherever the provider callbackUrls
+	 * point (usually /auth).
 	 */
 	function routes() {
 		var self = this
 		var router = boxExpressRouter()
 
 		router.post( "/logout", ( req, res, next ) => self.handleLogout( req, res ) )
+		router.post( "/:provider/link", ( req, res, next ) => self.handleLinkStart( req, res ) )
+		router.post( "/:provider/callback", ( req, res, next ) => self.handleFormPostCallback( req, res ) )
 		router.get( "/:provider", ( req, res, next ) => self.handleStart( req, res ) )
 		router.get( "/:provider/callback", ( req, res, next ) => self.handleCallback( req, res ) )
 
+		return router
+	}
+
+	/**
+	 * Just POST /:provider/callback, for providers that return the user
+	 * with a cross-site form post (Apple). Mount it at the same path as
+	 * routes() but *before* boxExpressCsrf(), which would otherwise refuse
+	 * the provider's POST — it carries no CSRF token and no session cookie.
+	 * It needs boxExpressUrlencoded() in front.
+	 */
+	function formPostRoutes() {
+		var self = this
+		var router = boxExpressRouter()
+		router.post( "/:provider/callback", ( req, res, next ) => self.handleFormPostCallback( req, res ) )
 		return router
 	}
 
@@ -138,12 +172,43 @@ class {
 		if ( !len( providerName ) ) {
 			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
 		}
-		var selected = variables.providers[ providerName ]
 		assertSession( req )
+		return beginAuthorization( req, res, providerName, { returnTo: safeReturnTo( req.query.returnTo ?: "" ) } )
+	}
 
+	/**
+	 * POST /:provider/link — a signed-in user attaching another provider
+	 * account. POST, so a page on another site can't start it with a link
+	 * or an <img>; put the button in a form with the app's CSRF token. The
+	 * callback then calls link( identity, user, tokens, req ) instead of
+	 * verify(), and only if the same user is still signed in.
+	 */
+	function handleLinkStart( req, res ) {
+		var providerName = registeredName( req.params.provider )
+		if ( !len( providerName ) || isSimpleValue( variables.linkFn ) ) {
+			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
+		}
+		assertSession( req )
+		if ( !populateUser( req ) ) {
+			if ( wantsHtml( req ) ) {
+				return res.redirect( variables.loginPath, 303 )
+			}
+			return res.status( 401 ).json( { error: true, code: "unauthenticated", message: "Authentication required" } )
+		}
+		var requestedReturn = req.body.returnTo ?: ( req.query.returnTo ?: "" )
+		return beginAuthorization( req, res, providerName, {
+			mode: "link",
+			linkUserId: sessionBucket( req, false ).userId,
+			returnTo: safeReturnTo( requestedReturn )
+		}, 303 )
+	}
+
+	function beginAuthorization( req, res, required string providerName, struct extra = {}, numeric redirectStatus = 302 ) {
+		var selected = variables.providers[ providerName ]
 		var state = variables.crypto.randomToken( 32 )
 		var codeVerifier = variables.crypto.randomToken( 32 )
 		var nonce = variables.crypto.randomToken( 16 )
+		var isLink = compare( extra.mode ?: "", "link" ) == 0
 
 		// Built before anything is stored: an OIDC provider may have to fetch
 		// its discovery document here, and if that fails the user should land
@@ -152,23 +217,71 @@ class {
 		try {
 			authorizeTarget = selected.authorizationUrl( state, codeVerifier, nonce, selected.callbackUrl )
 		} catch ( any e ) {
-			return fail( res, providerName, "provider_error", e )
+			return fail( res, providerName, "provider_error", e, isLink ? variables.linkFailureRedirect : variables.failureRedirect )
 		}
 
 		var bucket = sessionBucket( req, true )
 		if ( !isStruct( bucket.pending ?: "" ) ) {
 			bucket.pending = {}
 		}
-		bucket.pending[ providerName ] = {
+		var pending = {
 			state: state,
 			codeVerifier: codeVerifier,
 			nonce: nonce,
-			returnTo: safeReturnTo( req.query.returnTo ?: "" ),
+			returnTo: extra.returnTo ?: "",
 			createdAt: variables.crypto.nowMs()
 		}
+		if ( isLink ) {
+			pending.mode = "link"
+			pending.linkUserId = toString( extra.linkUserId )
+		}
+		bucket.pending[ providerName ] = pending
 
 		res.set( "Cache-Control", "no-store" )
-		return res.redirect( authorizeTarget )
+		return res.redirect( authorizeTarget, redirectStatus )
+	}
+
+	/**
+	 * A provider's form_post callback, turned into the ordinary GET one.
+	 *
+	 * The POST comes from the provider's site, so a SameSite=Lax session
+	 * cookie isn't sent with it and the pending login can't be found here.
+	 * A 303 to the GET callback is a top-level navigation, which does carry
+	 * the cookie; every check happens there. Only code, state and error go
+	 * into that URL — anything else the provider posted (Apple's user
+	 * name, its unverified id_token) is either handed to the provider to
+	 * hold server-side or dropped. No session is touched here.
+	 */
+	function handleFormPostCallback( req, res ) {
+		var providerName = registeredName( req.params.provider )
+		var selected = len( providerName ) ? variables.providers[ providerName ] : ""
+		if ( isSimpleValue( selected ) || !structKeyExists( selected, "acceptFormPost" ) ) {
+			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
+		}
+		res.set( "Cache-Control", "no-store" )
+		var fields = isStruct( req.body ?: "" ) ? req.body : {}
+		if ( !len( fields.state ?: "" ) && !len( fields.code ?: "" ) && !len( fields.error ?: "" ) ) {
+			return fail( res, providerName, "provider_error", {
+				type: "BoxExpressAuth.EmptyFormPost",
+				message: "the form_post callback had no code, state or error — is boxExpressUrlencoded() mounted before the auth routes?"
+			} )
+		}
+		var accepted = {}
+		try {
+			accepted = selected.acceptFormPost( fields )
+		} catch ( any e ) {
+			return fail( res, providerName, "provider_error", e )
+		}
+		var encoder = createObject( "java", "java.net.URLEncoder" )
+		var pairs = []
+		for ( var key in [ "code", "state", "error" ] ) {
+			var value = accepted[ key ] ?: ""
+			if ( isSimpleValue( value ) && len( value ) ) {
+				pairs.append( key & "=" & encoder.encode( value, "UTF-8" ) )
+			}
+		}
+		var callbackPath = listFirst( req.originalUrl, "?" )
+		return res.redirect( callbackPath & ( pairs.len() ? "?" & pairs.toList( "&" ) : "" ), 303 )
 	}
 
 	function handleCallback( req, res ) {
@@ -188,43 +301,49 @@ class {
 		var pendingAll = isStruct( bucket.pending ?: "" ) ? bucket.pending : {}
 		var pending = pendingAll[ providerName ] ?: ""
 		structDelete( pendingAll, providerName )
+		var isLink = isStruct( pending ) && compare( pending.mode ?: "", "link" ) == 0
+		var failTo = isLink ? variables.linkFailureRedirect : variables.failureRedirect
 
 		var providerError = req.query.error ?: ""
 		if ( !isSimpleValue( providerError ) || len( providerError ) ) {
-			return fail( res, providerName, compare( providerError, "access_denied" ) == 0 ? "access_denied" : "provider_error" )
+			return fail( res, providerName, compare( providerError, "access_denied" ) == 0 ? "access_denied" : "provider_error", javacast( "null", "" ), failTo )
 		}
 
 		var returnedState = req.query.state ?: ""
 		if ( !isStruct( pending ) || !isSimpleValue( returnedState ) || !len( returnedState ) || !variables.crypto.constantTimeEquals( returnedState, pending.state ) ) {
-			return fail( res, providerName, "invalid_state" )
+			return fail( res, providerName, "invalid_state", javacast( "null", "" ), failTo )
 		}
 		if ( variables.crypto.nowMs() - pending.createdAt > variables.stateTtlMs ) {
-			return fail( res, providerName, "expired_state" )
+			return fail( res, providerName, "expired_state", javacast( "null", "" ), failTo )
 		}
 
 		var code = req.query.code ?: ""
 		if ( !isSimpleValue( code ) || !len( code ) ) {
-			return fail( res, providerName, "provider_error" )
+			return fail( res, providerName, "provider_error", javacast( "null", "" ), failTo )
 		}
 
 		var tokens = {}
 		try {
 			tokens = selected.exchangeCode( code, pending.codeVerifier, selected.callbackUrl )
 		} catch ( any e ) {
-			return fail( res, providerName, "token_exchange_failed", e )
+			return fail( res, providerName, "token_exchange_failed", e, failTo )
 		}
 
 		var identity = {}
 		try {
-			identity = selected.fetchProfile( tokens, { nonce: pending.nonce } )
+			identity = selected.fetchProfile( tokens, { nonce: pending.nonce, state: pending.state } )
 		} catch ( any e ) {
-			return fail( res, providerName, "profile_failed", e )
+			return fail( res, providerName, "profile_failed", e, failTo )
 		}
 		if ( !isStruct( identity ) || !isSimpleValue( identity.id ?: "" ) || !len( identity.id ?: "" ) ) {
-			return fail( res, providerName, "profile_failed" )
+			return fail( res, providerName, "profile_failed", javacast( "null", "" ), failTo )
 		}
 		identity.provider = providerName
 		identity.id = toString( identity.id )
+
+		if ( isLink ) {
+			return completeLink( req, res, providerName, pending, identity, tokens )
+		}
 
 		// verify() and loadUser() are app code: if they throw, that's an app
 		// fault (a database being down, say) and goes to the app's error
@@ -240,14 +359,66 @@ class {
 		bucket = sessionBucket( req, true )
 		structDelete( bucket, "pending" )
 		bucket.userId = toString( verified.user.id )
+		bucket.provider = providerName
+		if ( structKeyExists( selected, "logoutState" ) ) {
+			var logoutState = selected.logoutState( tokens )
+			if ( isStruct( logoutState ) && structCount( logoutState ) ) {
+				bucket.logout = logoutState
+			}
+		}
 		req.user = verified.user
 
 		return res.redirect( len( pending.returnTo ) ? pending.returnTo : variables.successRedirect )
 	}
 
+	/**
+	 * The second half of a link: the provider identity checks out, so hand
+	 * it to link() along with the user who started it. Refused unless that
+	 * same user is still the one signed in — a logout, or a login as
+	 * someone else, in between would otherwise attach the identity to the
+	 * wrong account. No session regeneration: who is signed in hasn't
+	 * changed.
+	 */
+	function completeLink( req, res, required string providerName, required struct pending, required struct identity, required struct tokens ) {
+		var currentUserId = sessionBucket( req, false ).userId ?: ""
+		if ( !isSimpleValue( currentUserId ) || !len( currentUserId ) || compare( currentUserId, pending.linkUserId ?: "" ) != 0 || !populateUser( req ) ) {
+			return fail( res, providerName, "link_denied", { type: "BoxExpressAuth.LinkUserChanged", message: "the user who started the link isn't signed in any more" }, variables.linkFailureRedirect )
+		}
+		var linked = { result: variables.linkFn( identity, req.user, tokens, req ) }
+		if ( isNull( linked.result ) || ( isBoolean( linked.result ) && !linked.result ) ) {
+			return fail( res, providerName, "link_denied", javacast( "null", "" ), variables.linkFailureRedirect )
+		}
+		return res.redirect( len( pending.returnTo ) ? pending.returnTo : variables.linkRedirect )
+	}
+
+	/**
+	 * Ends the local session. If the user signed in through a provider that
+	 * logs out at the issuer too (OIDC with postLogoutRedirectUrl), the
+	 * browser goes there next: a redirect for a form post, or
+	 * 200 { logoutUrl } for a fetch() to navigate to. Otherwise a redirect
+	 * to successRedirect, or 204.
+	 */
 	function handleLogout( req, res ) {
 		assertSession( req )
+		var bucket = sessionBucket( req, false )
+		var issuerLogout = ""
+		var signedIn = isSimpleValue( bucket.userId ?: "" ) && len( bucket.userId ?: "" )
+		var selected = signedIn ? getProvider( bucket.provider ?: "" ) : ""
+		if ( !isSimpleValue( selected ) && structKeyExists( selected, "logoutUrl" ) ) {
+			try {
+				issuerLogout = selected.logoutUrl( isStruct( bucket.logout ?: "" ) ? bucket.logout : {} )
+			} catch ( any e ) {
+				// The local session still ends; only the issuer hop is lost.
+				println( "[BoxExpressAuth] #bucket.provider# logout at the issuer skipped: #e.type ?: 'error'#: #e.message ?: ''#" )
+			}
+		}
 		req.destroySession()
+		if ( isSimpleValue( issuerLogout ) && len( issuerLogout ) ) {
+			if ( wantsHtml( req ) ) {
+				return res.redirect( issuerLogout, 303 )
+			}
+			return res.status( 200 ).json( { logoutUrl: issuerLogout } )
+		}
 		if ( wantsHtml( req ) ) {
 			return res.redirect( variables.successRedirect )
 		}
@@ -316,15 +487,23 @@ class {
 		return variables.loginPath & ( find( "?", variables.loginPath ) ? "&" : "?" ) & "returnTo=" & createObject( "java", "java.net.URLEncoder" ).encode( returnTo, "UTF-8" )
 	}
 
+	/**
+	 * True for a browser navigation. A WebSocket upgrade never is, whatever
+	 * it sends as Accept: a redirect can't be followed by a socket, and the
+	 * refusal should be a plain 401.
+	 */
 	function wantsHtml( req ) {
+		if ( findNoCase( "websocket", req.get( "Upgrade" ) ?: "" ) ) {
+			return false
+		}
 		var accept = req.get( "Accept" ) ?: ""
 		return findNoCase( "text/html", accept ) > 0
 	}
 
-	function fail( res, required string providerName, required string code, any cause ) {
+	function fail( res, required string providerName, required string code, any cause, string redirectTo = variables.failureRedirect ) {
 		var detail = isNull( cause ) ? "" : " (#cause.type ?: 'error'#: #cause.message ?: ''#)"
 		println( "[BoxExpressAuth] #providerName# login failed: #code##detail#" )
-		var target = variables.failureRedirect & ( find( "?", variables.failureRedirect ) ? "&" : "?" ) & "error=" & code
+		var target = redirectTo & ( find( "?", redirectTo ) ? "&" : "?" ) & "error=" & code
 		return res.redirect( target )
 	}
 

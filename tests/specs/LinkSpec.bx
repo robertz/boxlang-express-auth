@@ -1,0 +1,183 @@
+/**
+ * POST /auth/:provider/link — attaching another provider account to the
+ * signed-in user, through link() instead of verify().
+ */
+class extends="testbox.system.BaseSpec" {
+
+	function buildLinkApp( struct authOptions = {}, boolean withCsrf = false ) {
+		variables.verifyCalls = []
+		variables.linkCalls = []
+		var seenVerify = variables.verifyCalls
+		var seenLink = variables.linkCalls
+		var options = {
+			verify: ( identity, tokens, req ) => {
+				seenVerify.append( identity )
+				return { id: identity.id }
+			},
+			link: ( identity, user, tokens, req ) => {
+				seenLink.append( { identity: identity, user: user, tokens: tokens } )
+				return true
+			}
+		}
+		options.append( authOptions, true )
+
+		var app = boxExpress()
+		app.use( boxExpressUrlencoded() )
+		app.use( boxExpressSession() )
+		if ( withCsrf ) {
+			app.use( boxExpressCsrf() )
+			app.get( "/test/csrf", ( req, res ) => res.json( { token: req.csrfToken() } ) )
+		}
+		variables.primary = boxExpressAuthTestProvider( { name: "primary", identity: { id: "owner" } } )
+		variables.secondary = boxExpressAuthTestProvider( { name: "secondary", identity: { id: "gh-583231", email: "octo@example.com" } } )
+		var auth = boxExpressAuth( options )
+		auth.provider( "primary", variables.primary )
+		auth.provider( "secondary", variables.secondary )
+		app.use( "/auth", auth.routes() )
+		app.get( "/test/session", ( req, res ) => res.json( { session: req.session, sessionID: req.sessionID } ) )
+		app.get( "/test/become/:id", ( req, res ) => {
+			req.session.auth.userId = req.params.id
+			res.send( "ok" )
+		} )
+		return app
+	}
+
+	function signIn( app ) {
+		return variables.primary.login( app ).cookies
+	}
+
+	function sessionOf( app, cookies ) {
+		return app.inject( { url: "/test/session", cookies: cookies } ).json()
+	}
+
+	function run() {
+
+		describe( "Linking a provider account", function() {
+
+			it( "calls link() with the new identity and the signed-in user, and keeps the session", function() {
+				var app = buildLinkApp()
+				var cookies = signIn( app )
+				var before = sessionOf( app, cookies )
+				var linked = variables.secondary.link( app, { cookies: cookies } )
+
+				expect( linked.started.statusCode ).toBe( 303 )
+				expect( linked.response.statusCode ).toBe( 302 )
+				expect( linked.location ).toBe( "/" )
+				expect( variables.linkCalls ).toHaveLength( 1 )
+				expect( variables.linkCalls[ 1 ].identity.provider ).toBe( "secondary" )
+				expect( variables.linkCalls[ 1 ].identity.id ).toBe( "gh-583231" )
+				expect( variables.linkCalls[ 1 ].user.id ).toBe( "owner" )
+				expect( variables.linkCalls[ 1 ].tokens.accessToken ).notToBeEmpty()
+				expect( variables.verifyCalls ).toHaveLength( 1 )
+
+				var after = sessionOf( app, linked.cookies )
+				expect( after.session.auth.userId ).toBe( "owner" )
+				expect( after.session.auth.provider ).toBe( "primary" )
+				expect( after.sessionID ).toBe( before.sessionID )
+				expect( after.session.auth.pending ).toBeEmpty()
+			} )
+
+			it( "goes to returnTo, or linkRedirect", function() {
+				var app = buildLinkApp( { linkRedirect: "/settings/accounts" } )
+				var cookies = signIn( app )
+				expect( variables.secondary.link( app, { cookies: cookies } ).location ).toBe( "/settings/accounts" )
+				expect( variables.secondary.link( app, { cookies: cookies, returnTo: "/settings/accounts?linked=1" } ).location ).toBe( "/settings/accounts?linked=1" )
+				expect( variables.secondary.link( app, { cookies: cookies, returnTo: "https://evil.test/" } ).location ).toBe( "/settings/accounts" )
+			} )
+
+			it( "needs a signed-in user: 401 for an API call, a redirect to login for a browser", function() {
+				var app = buildLinkApp()
+				var api = app.inject( { method: "POST", url: "/auth/secondary/link" } )
+				expect( api.statusCode ).toBe( 401 )
+				expect( api.json().code ).toBe( "unauthenticated" )
+				var browser = app.inject( { method: "POST", url: "/auth/secondary/link", headers: { "Accept": "text/html" } } )
+				expect( browser.statusCode ).toBe( 303 )
+				expect( browser.header( "Location" ) ).toBe( "/login" )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "is POST only", function() {
+				var app = buildLinkApp()
+				var cookies = signIn( app )
+				var response = app.inject( { url: "/auth/secondary/link", cookies: cookies } )
+				expect( response.statusCode ).toBe( 404 )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "isn't offered at all without a link option", function() {
+				var app = buildLinkApp( { link: javacast( "null", "" ) } )
+				var cookies = signIn( app )
+				expect( app.inject( { method: "POST", url: "/auth/secondary/link", cookies: cookies } ).statusCode ).toBe( 404 )
+			} )
+
+			it( "404s an unknown provider", function() {
+				var app = buildLinkApp()
+				var cookies = signIn( app )
+				expect( app.inject( { method: "POST", url: "/auth/nope/link", cookies: cookies } ).statusCode ).toBe( 404 )
+			} )
+
+			it( "fails with link_denied when link() returns false or null", function() {
+				var app = buildLinkApp( { link: ( identity, user ) => false, linkFailureRedirect: "/settings/accounts" } )
+				var cookies = signIn( app )
+				expect( variables.secondary.link( app, { cookies: cookies } ).location ).toBe( "/settings/accounts?error=link_denied" )
+				var nullApp = buildLinkApp( { link: ( identity, user ) => javacast( "null", "" ) } )
+				expect( variables.secondary.link( nullApp, { cookies: signIn( nullApp ) } ).location ).toBe( "/login?error=link_denied" )
+			} )
+
+			it( "sends provider failures to linkFailureRedirect", function() {
+				var app = buildLinkApp( { linkFailureRedirect: "/settings/accounts" } )
+				var cookies = signIn( app )
+				expect( variables.secondary.link( app, { cookies: cookies, deny: "access_denied" } ).location ).toBe( "/settings/accounts?error=access_denied" )
+				expect( variables.secondary.link( app, { cookies: cookies, fail: "profile_failed" } ).location ).toBe( "/settings/accounts?error=profile_failed" )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "refuses when a different user is signed in by the time the callback arrives", function() {
+				var app = buildLinkApp()
+				var cookies = signIn( app )
+				var started = app.inject( { method: "POST", url: "/auth/secondary/link", cookies: cookies } )
+				app.inject( { url: "/test/become/someone-else", cookies: cookies } )
+				var callbackTarget = variables.secondary.approve( started.header( "Location" ) )
+				var finished = app.inject( { url: callbackTarget, cookies: cookies } )
+				expect( finished.header( "Location" ) ).toBe( "/login?error=link_denied" )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "refuses after a logout in between", function() {
+				var app = buildLinkApp()
+				var cookies = signIn( app )
+				var started = app.inject( { method: "POST", url: "/auth/secondary/link", cookies: cookies } )
+				app.inject( { method: "POST", url: "/auth/logout", cookies: cookies } )
+				var finished = app.inject( { url: variables.secondary.approve( started.header( "Location" ) ), cookies: cookies } )
+				expect( finished.header( "Location" ) ).toInclude( "error=" )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "lets an ordinary login through the same provider still call verify()", function() {
+				var app = buildLinkApp()
+				variables.secondary.login( app )
+				expect( variables.verifyCalls ).toHaveLength( 1 )
+				expect( variables.linkCalls ).toBeEmpty()
+			} )
+
+			it( "composes with boxExpressCsrf: refused without the token, linked with it", function() {
+				var app = buildLinkApp( {}, true )
+				var cookies = signIn( app )
+				var refused = app.inject( { method: "POST", url: "/auth/secondary/link", cookies: cookies } )
+				expect( refused.statusCode ).toBe( 403 )
+				var csrf = app.inject( { url: "/test/csrf", cookies: cookies } )
+				cookies.append( csrf.cookies, true )
+				var linked = variables.secondary.link( app, { cookies: cookies, form: { "_csrf": csrf.json().token } } )
+				expect( linked.location ).toBe( "/" )
+				expect( variables.linkCalls ).toHaveLength( 1 )
+			} )
+
+			it( "rejects a link option that isn't a function", function() {
+				expect( () => boxExpressAuth( { verify: ( identity ) => identity, link: "yes" } ) ).toThrow( "BoxExpressAuth.InvalidConfig" )
+			} )
+
+		} )
+
+	}
+
+}

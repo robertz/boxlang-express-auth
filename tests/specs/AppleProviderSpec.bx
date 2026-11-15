@@ -1,0 +1,210 @@
+/**
+ * Sign in with Apple: the ES256 client-secret JWT, the form_post callback
+ * turned into a GET, and the one-time name handed across it.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	/**
+	 * What Apple does after "Continue": a cross-site POST to the callback,
+	 * which carries no session cookie.
+	 */
+	function applePost( app, required struct fields ) {
+		return app.inject( { method: "POST", url: "/auth/apple/callback", form: fields } )
+	}
+
+	/**
+	 * A whole Apple login: start, mint the token response, Apple's POST,
+	 * then the GET callback the POST redirects to.
+	 */
+	function appleLogin( app, struct claims = {}, string userJson = "", struct postFields = {} ) {
+		var started = app.inject( "/auth/apple" )
+		var location = started.header( "Location" )
+		var finalClaims = standardClaims( queryParam( location, "nonce" ) )
+		structDelete( finalClaims, "name" )
+		structDelete( finalClaims, "preferred_username" )
+		structDelete( finalClaims, "picture" )
+		finalClaims.append( claims, true )
+		variables.fake.respond( "POST #variables.endpoints.token#", { body: { access_token: "at-apple", token_type: "Bearer", id_token: variables.idp.sign( finalClaims ), expires_in: 3600 } } )
+		var fields = { code: "apple-code", state: queryParam( location, "state" ), id_token: "posted.but.ignored" }
+		if ( len( userJson ) ) {
+			fields.user = userJson
+		}
+		fields.append( postFields, true )
+		var posted = applePost( app, fields )
+		var finished = posted.statusCode == 303
+			? app.inject( { url: posted.header( "Location" ), cookies: started.cookies } )
+			: posted
+		return { started: started, location: location, posted: posted, finished: finished }
+	}
+
+	function run() {
+
+		describe( "Apple", function() {
+
+			it( "asks for name and email with response_mode=form_post", function() {
+				var location = buildOidcApp( "apple" ).inject( "/auth/apple" ).header( "Location" )
+				expect( location ).toInclude( "https://appleid.apple.com/auth/authorize?" )
+				expect( queryParam( location, "scope" ) ).toBe( "name email" )
+				expect( queryParam( location, "response_mode" ) ).toBe( "form_post" )
+				expect( queryParam( location, "nonce" ) ).notToBeEmpty()
+			} )
+
+			it( "uses a plain GET callback when no scopes are asked for", function() {
+				var location = buildOidcApp( "apple", { scopes: [] } ).inject( "/auth/apple" ).header( "Location" )
+				expect( location ).notToInclude( "response_mode" )
+				expect( location ).notToInclude( "scope=" )
+			} )
+
+			it( "turns Apple's POST into a 303 to the GET callback carrying only code and state", function() {
+				var flow = appleLogin( buildOidcApp( "apple" ), {}, '{"name":{"firstName":"Ada","lastName":"Lovelace"},"email":"ada@example.com"}' )
+				expect( flow.posted.statusCode ).toBe( 303 )
+				var target = flow.posted.header( "Location" )
+				expect( target ).toMatch( "^/auth/apple/callback\?" )
+				expect( queryParam( target, "code" ) ).toBe( "apple-code" )
+				expect( queryParam( target, "state" ) ).notToBeEmpty()
+				expect( target ).notToInclude( "Ada" )
+				expect( target ).notToInclude( "id_token" )
+				expect( target ).notToInclude( "user=" )
+				expect( flow.posted.header( "Cache-Control" ) ).toBe( "no-store" )
+				expectOidcSuccess( flow )
+			} )
+
+			it( "logs in with sub, the signed email, and the name from the first authorization", function() {
+				var flow = appleLogin( buildOidcApp( "apple" ), { email: "abc@privaterelay.appleid.com", email_verified: "true", is_private_email: "true" }, '{"name":{"firstName":"Ada","lastName":"Lovelace"},"email":"spoofed@example.com"}' )
+				expectOidcSuccess( flow )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.provider ).toBe( "apple" )
+				expect( identity.id ).toBe( "user-123" )
+				expect( identity.name ).toBe( "Ada Lovelace" )
+				expect( identity.email ).toBe( "abc@privaterelay.appleid.com" )
+				expect( identity.emailVerified ).toBeTrue()
+				expect( identity.isPrivateEmail ).toBeTrue()
+			} )
+
+			it( "logs in without a name on later authorizations, when Apple sends no user field", function() {
+				expectOidcSuccess( appleLogin( buildOidcApp( "apple" ) ) )
+				expect( variables.verifyCalls[ 1 ].identity.name ).toBe( "" )
+				expect( variables.verifyCalls[ 1 ].identity.isPrivateEmail ).toBeFalse()
+			} )
+
+			it( "ignores a malformed user field", function() {
+				expectOidcSuccess( appleLogin( buildOidcApp( "apple" ), {}, "{not json" ) )
+				expect( variables.verifyCalls[ 1 ].identity.name ).toBe( "" )
+			} )
+
+			it( "only hands a held name to the login whose state it was posted with", function() {
+				var app = buildOidcApp( "apple" )
+				applePost( app, { state: "someone-elses-state", code: "x", user: '{"name":{"firstName":"Mallory"}}' } )
+				expectOidcSuccess( appleLogin( app ) )
+				expect( variables.verifyCalls[ 1 ].identity.name ).toBe( "" )
+			} )
+
+			it( "maps Apple's cancel to access_denied", function() {
+				var app = buildOidcApp( "apple" )
+				var started = app.inject( "/auth/apple" )
+				var posted = applePost( app, { error: "user_cancelled_authorize", state: queryParam( started.header( "Location" ), "state" ) } )
+				var finished = app.inject( { url: posted.header( "Location" ), cookies: started.cookies } )
+				expect( finished.header( "Location" ) ).toBe( "/login?error=access_denied" )
+			} )
+
+			it( "still checks state on the GET: a forged POST gets nowhere", function() {
+				var app = buildOidcApp( "apple" )
+				var started = app.inject( "/auth/apple" )
+				var posted = applePost( app, { code: "attacker-code", state: "forged" } )
+				var finished = app.inject( { url: posted.header( "Location" ), cookies: started.cookies } )
+				expect( finished.header( "Location" ) ).toBe( "/login?error=invalid_state" )
+				expect( variables.fake.callsTo( "POST #variables.endpoints.token#" ) ).toBeEmpty()
+			} )
+
+			it( "sends a fresh ES256 client-secret JWT signed by the team's key", function() {
+				var app = buildOidcApp( "apple" )
+				expectOidcSuccess( appleLogin( app ) )
+				var exchange = variables.fake.callsTo( "POST #variables.endpoints.token#" )[ 1 ]
+				var jwt = new bxModules.boxexpressauth.models.Jwt()
+				var secret = jwt.decode( exchange.form.client_secret )
+				expect( jwt.verify( secret, variables.appleKey.jwk(), "ES256" ) ).toBeTrue()
+				expect( secret.header.alg ).toBe( "ES256" )
+				expect( secret.header.kid ).toBe( variables.appleKey.getKid() )
+				expect( secret.payload.iss ).toBe( "TEAM123456" )
+				expect( secret.payload.sub ).toBe( variables.CLIENT_ID )
+				expect( secret.payload.aud ).toBe( "https://appleid.apple.com" )
+				expect( secret.payload.exp - secret.payload.iat ).toBe( 300 )
+				expect( exchange.form.client_id ).toBe( variables.CLIENT_ID )
+			} )
+
+			it( "rejects an ID token from another issuer", function() {
+				expectOidcFailure( appleLogin( buildOidcApp( "apple" ), { iss: "https://appleid.apple.com.evil.test" } ), "profile_failed" )
+			} )
+
+			it( "fails a POST with no fields (no body parser) as provider_error", function() {
+				var response = applePost( buildOidcApp( "apple" ), {} )
+				expect( response.header( "Location" ) ).toBe( "/login?error=provider_error" )
+			} )
+
+			it( "404s a POST callback for a provider that doesn't use form_post", function() {
+				var app = buildOidcApp( "idp" )
+				expect( app.inject( { method: "POST", url: "/auth/idp/callback", form: { code: "x", state: "y" } } ).statusCode ).toBe( 404 )
+			} )
+
+			it( "works mounted before boxExpressCsrf through formPostRoutes()", function() {
+				var endpoints = endpointsFor( "apple" )
+				variables.endpoints = endpoints
+				variables.fake = new tests.helpers.FakeHttpClient( discoveryResponses( endpoints ) )
+				variables.verifyCalls = []
+				var seen = variables.verifyCalls
+				var app = boxExpress()
+				app.use( boxExpressUrlencoded() )
+				app.use( boxExpressSession() )
+				var auth = boxExpressAuth( { verify: ( identity ) => {
+					seen.append( { identity: identity } )
+					return { id: 1 }
+				} } )
+				auth.provider( "apple", boxExpressAuthApple( {
+					clientId: variables.CLIENT_ID,
+					teamId: "TEAM123456",
+					keyId: variables.appleKey.getKid(),
+					privateKey: variables.appleKey.privateKeyPem(),
+					callbackUrl: endpoints.callback,
+					httpClient: variables.fake
+				} ) )
+				app.use( "/auth", auth.formPostRoutes() )
+				app.use( boxExpressCsrf() )
+				app.use( "/auth", auth.routes() )
+				expectOidcSuccess( appleLogin( app ) )
+			} )
+
+			it( "needs teamId, keyId and a P-256 PKCS##8 privateKey", function() {
+				var good = {
+					clientId: "com.example.web",
+					teamId: "TEAM123456",
+					keyId: "ABC123DEFG",
+					privateKey: variables.appleKey.privateKeyPem(),
+					callbackUrl: "https://tracker.test/auth/apple/callback"
+				}
+				expect( boxExpressAuthApple( good ).name ).toBe( "apple" )
+				var rsaPem = new tests.helpers.TestIssuer( "r" ).privateKeyPem()
+				var p384Pem = new tests.helpers.TestIssuer( "p", 0, "ES384" ).privateKeyPem()
+				for ( var change in [ { teamId: "" }, { teamId: "team" }, { keyId: "" }, { privateKey: "" }, { privateKey: "not a key" }, { privateKey: rsaPem }, { privateKey: p384Pem } ] ) {
+					var options = structCopy( good )
+					options.append( change, true )
+					expect( () => boxExpressAuthApple( options ) ).withContext( structKeyList( change ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				}
+			} )
+
+			it( "never puts the private key in an error message", function() {
+				var pem = variables.appleKey.privateKeyPem()
+				var broken = replace( pem, "A", "!", "all" )
+				try {
+					boxExpressAuthApple( { clientId: "c", teamId: "TEAM123456", keyId: "ABC123DEFG", privateKey: broken, callbackUrl: "https://tracker.test/auth/apple/callback" } )
+					fail( "expected a throw" )
+				} catch ( "BoxExpressAuth.InvalidProvider" e ) {
+					expect( e.message ).notToInclude( "MIG" )
+					expect( e.message & ( e.detail ?: "" ) ).notToInclude( mid( listGetAt( pem, 2, char( 10 ) ), 1, 20 ) )
+				}
+			} )
+
+		} )
+
+	}
+
+}
