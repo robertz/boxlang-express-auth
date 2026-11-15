@@ -1,0 +1,119 @@
+/**
+ * Shared setup: an app with sessions, the auth routes, a GitHub provider on
+ * a FakeHttpClient, and a few test-only routes for looking inside the
+ * session. Each spec extends this.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	variables.TOKEN_URL = "https://github.com/login/oauth/access_token"
+	variables.USER_URL = "https://api.github.com/user"
+	variables.EMAILS_URL = "https://api.github.com/user/emails"
+	variables.CALLBACK_URL = "https://tracker.test/auth/github/callback"
+
+	function afterEach() {
+		if ( !isNull( variables.fake ) ) {
+			expect( variables.fake.getUnexpected() ).withContext( "the fake http client got requests it wasn't scripted for" ).toBeEmpty()
+		}
+	}
+
+	function githubResponses() {
+		return {
+			"POST #variables.TOKEN_URL#": { body: { access_token: "gho_secret_access_token", token_type: "bearer", scope: "read:user,user:email" } },
+			"GET #variables.USER_URL#": { body: { id: 583231, login: "octocat", name: "The Octocat", email: javacast( "null", "" ), avatar_url: "https://avatars.githubusercontent.com/u/583231" } },
+			"GET #variables.EMAILS_URL#": { body: [
+				{ email: "old@example.com", primary: false, verified: true },
+				{ email: "octocat@github.com", primary: true, verified: true }
+			] }
+		}
+	}
+
+	/**
+	 * @authOptions merged over a verify() that accepts everyone as user 7
+	 * @responses   replaces githubResponses() entries by key
+	 */
+	function buildApp( struct authOptions = {}, struct responses = {}, boolean withSession = true ) {
+		var scripted = githubResponses()
+		scripted.append( responses, true )
+		variables.fake = new tests.helpers.FakeHttpClient( scripted )
+		variables.verifyCalls = []
+
+		var seen = variables.verifyCalls
+		var options = {
+			verify: ( identity, tokens, req ) => {
+				seen.append( { identity: identity, tokens: tokens } )
+				return { id: 7 }
+			}
+		}
+		options.append( authOptions, true )
+
+		var app = boxExpress()
+		if ( withSession ) {
+			app.use( boxExpressSession() )
+		}
+		var auth = boxExpressAuth( options )
+		auth.provider( "github", boxExpressAuthGitHub( {
+			clientId: "test-client-id",
+			clientSecret: "test-client-secret",
+			callbackUrl: variables.CALLBACK_URL,
+			httpClient: variables.fake
+		} ) )
+		app.use( "/auth", auth.routes() )
+
+		app.get( "/test/session", ( req, res ) => res.json( { session: req.session, sessionID: req.sessionID } ) )
+		app.get( "/test/age-state", ( req, res ) => {
+			req.session.auth.pending.github.createdAt -= 11 * 60 * 1000
+			res.send( "aged" )
+		} )
+		app.get( "/dashboard", auth.required(), ( req, res ) => res.json( { user: req.user } ) )
+		app.get( "/maybe", auth.optional(), ( req, res ) => res.json( { user: req.user ?: "anonymous" } ) )
+		app.use( ( err, req, res, next ) => res.status( 500 ).json( { errorType: err.type ?: "", message: err.message ?: "" } ) )
+
+		variables.auth = auth
+		return app
+	}
+
+	/**
+	 * GET /auth/github and return what the callback needs: the redirect,
+	 * the state from it, and the cookies holding the pending session.
+	 */
+	function startLogin( app, struct query = {} ) {
+		var started = app.inject( { url: "/auth/github", query: query } )
+		return {
+			response: started,
+			location: started.header( "Location" ),
+			state: queryParam( started.header( "Location" ), "state" ),
+			cookies: started.cookies
+		}
+	}
+
+	function callback( app, struct cookies, struct query ) {
+		return app.inject( { url: "/auth/github/callback", query: query, cookies: cookies } )
+	}
+
+	function completeLogin( app, struct startQuery = {} ) {
+		var started = startLogin( app, startQuery )
+		var finished = callback( app, started.cookies, { code: "the-code", state: started.state } )
+		return { started: started, finished: finished }
+	}
+
+	function queryParam( required string targetUrl, required string name ) {
+		var queryStart = find( "?", targetUrl )
+		if ( !queryStart ) {
+			return ""
+		}
+		var decoder = createObject( "java", "java.net.URLDecoder" )
+		for ( var pair in listToArray( mid( targetUrl, queryStart + 1, len( targetUrl ) ), "&" ) ) {
+			var equalsAt = find( "=", pair )
+			var key = equalsAt ? mid( pair, 1, equalsAt - 1 ) : pair
+			if ( compare( decoder.decode( key, "UTF-8" ), name ) == 0 ) {
+				return equalsAt ? decoder.decode( mid( pair, equalsAt + 1, len( pair ) ), "UTF-8" ) : ""
+			}
+		}
+		return ""
+	}
+
+	function sessionOf( app, struct cookies ) {
+		return app.inject( { url: "/test/session", cookies: cookies } ).json().session
+	}
+
+}

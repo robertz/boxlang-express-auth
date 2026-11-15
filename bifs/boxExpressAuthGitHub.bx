@@ -1,0 +1,17 @@
+/**
+ * Global BIF wrapping the GitHub provider.
+ *
+ *   auth.provider( "github", boxExpressAuthGitHub( {
+ *     clientId: getSystemSetting( "GITHUB_CLIENT_ID" ),
+ *     clientSecret: getSystemSetting( "GITHUB_CLIENT_SECRET" ),
+ *     callbackUrl: "https://tracker.example.com/auth/github/callback"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.GitHub( options )
+	}
+
+}

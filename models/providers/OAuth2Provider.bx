@@ -1,0 +1,187 @@
+/**
+ * Base class for OAuth2 authorization-code providers. Handles the parts
+ * every such provider shares: option validation, building the authorize URL
+ * (always with PKCE S256), and exchanging the code at the token endpoint.
+ * A subclass supplies its endpoints through init()'s defaults and implements
+ * fetchProfile().
+ *
+ * The provider contract Auth relies on — anything with these members works,
+ * whether or not it extends this class:
+ *
+ *   name
+ *   callbackUrl
+ *   authorizationUrl( state, codeVerifier, nonce, callbackUrl ) → string
+ *   exchangeCode( code, codeVerifier, callbackUrl )              → { accessToken, tokenType, scope }
+ *   fetchProfile( tokens, context ) → { provider, id, email, emailVerified, name, username, avatarUrl, raw }
+ *     context = { nonce } — the nonce minted for this login, for providers
+ *     that must check it (OIDC id_token); plain OAuth2 ignores it.
+ *
+ * exchangeCode() and fetchProfile() throw on failure; Auth turns any throw
+ * into a failureRedirect. Messages from those throws are logged, so they
+ * must never contain the code, a token, or the client secret.
+ */
+class {
+
+	/**
+	 * @options  what the app passed in (clientId, clientSecret, callbackUrl, scopes, httpClient, userAgent)
+	 * @defaults what the subclass fixes (name, authorizeUrl, tokenUrl, scopes)
+	 */
+	function init( struct options = {}, struct defaults = {} ) {
+		var merged = structCopy( defaults )
+		merged.append( options, true )
+
+		this.name = merged.name ?: ""
+		this.callbackUrl = merged.callbackUrl ?: ""
+
+		var providerLabel = len( this.name ) ? this.name : "OAuth2"
+		for ( var required in [ "clientId", "clientSecret", "callbackUrl" ] ) {
+			if ( !isSimpleValue( merged[ required ] ?: "" ) || !len( trim( merged[ required ] ?: "" ) ) ) {
+				throw(
+					type = "BoxExpressAuth.InvalidProvider",
+					message = "The #providerLabel# provider needs a non-empty #required#"
+				)
+			}
+		}
+		if ( !reFindNoCase( "^https?://", this.callbackUrl ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "The #providerLabel# provider's callbackUrl must be an absolute http(s) URL — it has to match the one registered with the provider exactly"
+			)
+		}
+		for ( var endpoint in [ "authorizeUrl", "tokenUrl" ] ) {
+			if ( !len( merged[ endpoint ] ?: "" ) ) {
+				throw(
+					type = "BoxExpressAuth.InvalidProvider",
+					message = "The #providerLabel# provider has no #endpoint#"
+				)
+			}
+		}
+
+		variables.clientId = merged.clientId
+		variables.clientSecret = merged.clientSecret
+		variables.authorizeUrl = merged.authorizeUrl
+		variables.tokenUrl = merged.tokenUrl
+		variables.scopes = merged.scopes ?: []
+		variables.scopeSeparator = merged.scopeSeparator ?: " "
+		variables.userAgent = merged.userAgent ?: "boxlang-express-auth"
+		variables.httpClient = merged.httpClient ?: new "../HttpClient"()
+		variables.crypto = new "../Crypto"()
+		return this
+	}
+
+	function authorizationUrl( required string state, required string codeVerifier, string nonce = "", string callbackUrl = this.callbackUrl ) {
+		var params = [
+			[ "response_type", "code" ],
+			[ "client_id", variables.clientId ],
+			[ "redirect_uri", callbackUrl ],
+			[ "state", state ],
+			[ "code_challenge", variables.crypto.s256( codeVerifier ) ],
+			[ "code_challenge_method", "S256" ]
+		]
+		if ( arrayLen( variables.scopes ) ) {
+			params.append( [ "scope", arrayToList( variables.scopes, variables.scopeSeparator ) ] )
+		}
+		params.append( authorizationParams( nonce ), true )
+		return variables.authorizeUrl & ( find( "?", variables.authorizeUrl ) ? "&" : "?" ) & encodeQuery( params )
+	}
+
+	/**
+	 * Extra authorize-URL parameters as [ name, value ] pairs. Plain OAuth2
+	 * has none; an OIDC provider returns [ [ "nonce", nonce ] ] here.
+	 */
+	function authorizationParams( string nonce = "" ) {
+		return []
+	}
+
+	function exchangeCode( required string code, required string codeVerifier, string callbackUrl = this.callbackUrl ) {
+		var response = variables.httpClient.request( {
+			method: "POST",
+			url: variables.tokenUrl,
+			headers: {
+				"Accept": "application/json",
+				"User-Agent": variables.userAgent
+			},
+			form: {
+				"grant_type": "authorization_code",
+				"code": code,
+				"redirect_uri": callbackUrl,
+				"client_id": variables.clientId,
+				"client_secret": variables.clientSecret,
+				"code_verifier": codeVerifier
+			}
+		} )
+
+		var payload = parseJSON( response.body )
+		// GitHub answers a bad or expired code with HTTP 200 and an error
+		// field, so the status alone doesn't tell success from failure.
+		if ( isStruct( payload ) && len( payload.error ?: "" ) ) {
+			throw(
+				type = "BoxExpressAuth.TokenExchangeFailed",
+				message = "#this.name# token endpoint returned error '#_safeCode( payload.error )#'"
+			)
+		}
+		if ( response.status < 200 || response.status >= 300 ) {
+			throw(
+				type = "BoxExpressAuth.TokenExchangeFailed",
+				message = "#this.name# token endpoint answered HTTP #response.status#"
+			)
+		}
+		if ( !isStruct( payload ) || !len( payload.access_token ?: "" ) ) {
+			throw(
+				type = "BoxExpressAuth.TokenExchangeFailed",
+				message = "#this.name# token endpoint response had no access_token"
+			)
+		}
+		return {
+			accessToken: payload.access_token,
+			tokenType: payload.token_type ?: "bearer",
+			scope: payload.scope ?: ""
+		}
+	}
+
+	function fetchProfile( required struct tokens, struct context = {} ) {
+		throw(
+			type = "BoxExpressAuth.NotImplemented",
+			message = "#getMetadata( this ).name# must implement fetchProfile( tokens )"
+		)
+	}
+
+	/**
+	 * Authenticated GET returning parsed JSON, for fetchProfile()
+	 * implementations. Throws BoxExpressAuth.ProfileFailed on a non-2xx.
+	 */
+	function getJSON( required string targetUrl, required struct tokens, struct headers = {} ) {
+		var requestHeaders = {
+			"Authorization": "Bearer " & tokens.accessToken,
+			"Accept": "application/json",
+			"User-Agent": variables.userAgent
+		}
+		requestHeaders.append( headers, true )
+		var response = variables.httpClient.request( { method: "GET", url: targetUrl, headers: requestHeaders } )
+		if ( response.status < 200 || response.status >= 300 ) {
+			throw(
+				type = "BoxExpressAuth.ProfileFailed",
+				message = "#this.name# GET #targetUrl# answered HTTP #response.status#"
+			)
+		}
+		return parseJSON( response.body )
+	}
+
+	function parseJSON( body ) {
+		return isJSON( body ?: "" ) ? jsonDeserialize( body ) : ""
+	}
+
+	function encodeQuery( required array params ) {
+		var encoder = createObject( "java", "java.net.URLEncoder" )
+		return params.map( ( pair ) => encoder.encode( pair[ 1 ], "UTF-8" ) & "=" & encoder.encode( pair[ 2 ], "UTF-8" ) ).toList( "&" )
+	}
+
+	/**
+	 * Provider error codes are logged; keep them to the token-shaped values
+	 * the spec defines so a hostile endpoint can't write arbitrary text.
+	 */
+	function _safeCode( value ) {
+		return isSimpleValue( value ) && reFind( "^[A-Za-z0-9_.\-]{1,64}$", value ) ? value : "unrecognized"
+	}
+
+}

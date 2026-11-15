@@ -1,0 +1,43 @@
+/**
+ * The few security primitives the OAuth flow needs, kept in one place so
+ * they are easy to audit: CSPRNG tokens, the PKCE S256 transform, and a
+ * constant-time string comparison.
+ */
+class {
+
+	function init() {
+		variables.random = createObject( "java", "java.security.SecureRandom" ).init()
+		variables.encoder = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
+		return this
+	}
+
+	/**
+	 * base64url, no padding. 32 bytes gives a 43-character string, which is
+	 * also the minimum length RFC 7636 allows for a PKCE code verifier.
+	 */
+	function randomToken( numeric byteCount = 32 ) {
+		var bytes = createObject( "java", "java.lang.reflect.Array" ).newInstance( createObject( "java", "java.lang.Byte" ).TYPE, byteCount )
+		variables.random.nextBytes( bytes )
+		return variables.encoder.encodeToString( bytes )
+	}
+
+	function s256( required string verifier ) {
+		var digest = createObject( "java", "java.security.MessageDigest" ).getInstance( "SHA-256" )
+		return variables.encoder.encodeToString( digest.digest( charsetDecode( verifier, "US-ASCII" ) ) )
+	}
+
+	/**
+	 * MessageDigest.isEqual() doesn't short-circuit on the first differing
+	 * byte, so the time taken doesn't reveal how much of a guessed state
+	 * value was right. It does reveal a length mismatch, which is harmless
+	 * here: every state value has the same length.
+	 */
+	function constantTimeEquals( required string a, required string b ) {
+		return createObject( "java", "java.security.MessageDigest" ).isEqual( charsetDecode( a, "UTF-8" ), charsetDecode( b, "UTF-8" ) )
+	}
+
+	function nowMs() {
+		return createObject( "java", "java.lang.System" ).currentTimeMillis()
+	}
+
+}

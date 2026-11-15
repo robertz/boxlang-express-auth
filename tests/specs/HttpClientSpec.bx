@@ -1,0 +1,75 @@
+/**
+ * The default HttpClient against an in-process BoxExpress server on
+ * loopback — the one spec that opens a socket, and it never leaves the
+ * machine. Every provider spec uses FakeHttpClient instead.
+ */
+class extends="testbox.system.BaseSpec" {
+
+	variables.PORT = 38741
+
+	function beforeAll() {
+		variables.server = boxExpress()
+		variables.server.use( boxExpressUrlencoded() )
+		variables.server.post( "/token", ( req, res ) => res.json( {
+			form: req.body,
+			accept: req.get( "Accept" ) ?: "",
+			userAgent: req.get( "User-Agent" ) ?: ""
+		} ) )
+		variables.server.get( "/teapot", ( req, res ) => res.status( 418 ).send( "short and stout" ) )
+		variables.server.get( "/bad-gateway", ( req, res ) => res.status( 502 ).send( "upstream down" ) )
+		variables.server.get( "/moved", ( req, res ) => res.redirect( "/teapot" ) )
+		variables.server.listen( variables.PORT, () => {}, { block: false } )
+	}
+
+	function afterAll() {
+		variables.server.close()
+	}
+
+	function run() {
+
+		describe( "HttpClient", function() {
+
+			it( "posts form fields with the given headers and returns status and body", function() {
+				var response = new models.HttpClient().request( {
+					method: "POST",
+					url: "http://127.0.0.1:#variables.PORT#/token",
+					headers: { "Accept": "application/json", "User-Agent": "spec-agent" },
+					form: { code: "a b&c=d", code_verifier: "v" }
+				} )
+				expect( response.status ).toBe( 200 )
+				var echoed = jsonDeserialize( response.body )
+				expect( echoed.form.code ).toBe( "a b&c=d" )
+				expect( echoed.accept ).toBe( "application/json" )
+				expect( echoed.userAgent ).toBe( "spec-agent" )
+			} )
+
+			it( "returns an error status instead of throwing", function() {
+				var response = new models.HttpClient().request( { url: "http://127.0.0.1:#variables.PORT#/teapot" } )
+				expect( response.status ).toBe( 418 )
+				expect( response.body ).toBe( "short and stout" )
+			} )
+
+			it( "returns a real 502 from the far end as a status, not a connection failure", function() {
+				var response = new models.HttpClient().request( { url: "http://127.0.0.1:#variables.PORT#/bad-gateway" } )
+				expect( response.status ).toBe( 502 )
+				expect( response.body ).toBe( "upstream down" )
+			} )
+
+			it( "does not follow redirects", function() {
+				expect( new models.HttpClient().request( { url: "http://127.0.0.1:#variables.PORT#/moved" } ).status ).toBe( 302 )
+			} )
+
+			it( "throws BoxExpressAuth.HttpError when nothing answers, without the query string in the message", function() {
+				try {
+					new models.HttpClient( 2 ).request( { url: "http://127.0.0.1:1/token?code=should-not-leak" } )
+					fail( "expected a throw" )
+				} catch ( "BoxExpressAuth.HttpError" e ) {
+					expect( e.message ).notToInclude( "should-not-leak" )
+				}
+			} )
+
+		} )
+
+	}
+
+}

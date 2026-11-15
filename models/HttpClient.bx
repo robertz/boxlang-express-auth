@@ -1,0 +1,61 @@
+/**
+ * Default outbound HTTP client for providers: a thin wrapper over bx:http.
+ * Providers only ever call request(), so tests (and apps that need a proxy,
+ * custom TLS, or tracing) pass their own object with the same method as the
+ * httpClient provider option.
+ *
+ *   request( { method, url, headers: {}, form: {} } )
+ *     → { status: 200, headers: {}, body: "..." }
+ *
+ * Never throws for an HTTP error status — the caller decides what a 4xx
+ * means. Does throw if the request couldn't be made at all.
+ */
+class {
+
+	function init( numeric timeoutSeconds = 15 ) {
+		variables.timeoutSeconds = timeoutSeconds
+		return this
+	}
+
+	function request( required struct options ) {
+		var requestMethod = uCase( options.method ?: "GET" )
+		var requestHeaders = options.headers ?: {}
+		var formFields = options.form ?: {}
+		var result = {}
+
+		bx:http url=options.url method=requestMethod result="result" throwOnError=false timeout=variables.timeoutSeconds redirect=false {
+			for ( var headerName in requestHeaders ) {
+				bx:httpparam type="header" name=headerName value=requestHeaders[ headerName ];
+			}
+			for ( var fieldName in formFields ) {
+				bx:httpparam type="formfield" name=fieldName value=formFields[ fieldName ];
+			}
+		}
+
+		// bx:http reports a request that never got an answer (refused, DNS,
+		// timeout) as a synthetic 502 "Connection Failure" with errorDetail
+		// set; a real 502 from the far end leaves errorDetail empty.
+		var status = val( result.status_code ?: 0 )
+		if ( status == 0 || len( result.errorDetail ?: "" ) ) {
+			throw(
+				type = "BoxExpressAuth.HttpError",
+				message = "#requestMethod# #_withoutQuery( options.url )# failed: #result.errorDetail ?: 'no response'#"
+			)
+		}
+		return {
+			status: status,
+			headers: result.responseHeader ?: {},
+			body: toString( result.fileContent ?: "" )
+		}
+	}
+
+	/**
+	 * Error messages end up in logs; a query string is the one part of a
+	 * provider URL that could ever carry something sensitive.
+	 */
+	function _withoutQuery( required string targetUrl ) {
+		var queryStart = find( "?", targetUrl )
+		return queryStart ? mid( targetUrl, 1, queryStart - 1 ) : targetUrl
+	}
+
+}

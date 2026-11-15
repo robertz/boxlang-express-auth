@@ -1,0 +1,4 @@
+/testbox
+/boxlang_modules
+tests/results/
+.env

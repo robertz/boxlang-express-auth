@@ -1,0 +1,15 @@
+/**
+ * Global BIF wrapping Auth — the login core.
+ *
+ *   auth = boxExpressAuth( { verify: ( identity, tokens, req ) => users.findOrCreate( identity ) } )
+ *   auth.provider( "github", boxExpressAuthGitHub( { ... } ) )
+ *   app.use( "/auth", auth.routes() )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.Auth( options )
+	}
+
+}

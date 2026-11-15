@@ -1,0 +1,53 @@
+{
+    "name":"BoxExpressAuth",
+    "version":"0.1.0",
+    "author":"Robert Zehnder",
+    "slug":"boxlang-express-auth",
+    "shortDescription":"Pluggable OAuth2 login for BoxExpress apps, starting with GitHub",
+    "type":"boxlang-modules",
+    "keywords":[
+        "boxlang",
+        "express",
+        "oauth",
+        "oauth2",
+        "github",
+        "login",
+        "authentication"
+    ],
+    "homepage":"https://github.com/robertz/boxlang-express-auth",
+    "repository":{
+        "type":"git",
+        "URL":"https://github.com/robertz/boxlang-express-auth"
+    },
+    "boxlang":{
+        "minimumVersion":"1.15.0",
+        "moduleName":"boxexpressauth"
+    },
+    "private":false,
+    "license":[
+        {
+            "type":"MIT",
+            "URL":"https://opensource.org/licenses/MIT"
+        }
+    ],
+    "devDependencies":{
+        "testbox":"^7.1.0+20",
+        "boxlang-express":"^0.2.26"
+    },
+    "installPaths":{
+        "testbox":"testbox/",
+        "boxlang-express":"boxlang_modules/boxexpress/"
+    },
+    "scripts":{
+        "preVersion":"!boxlang run-tests.bxs"
+    },
+    "ignore":[
+        "**/.*",
+        "tests/**",
+        "examples/**",
+        "run-tests.bxs",
+        "setup-tests.bxs",
+        "testbox/**",
+        "boxlang_modules/**"
+    ]
+}

@@ -1,0 +1,38 @@
+/**
+ * BoxExpressAuth module descriptor. Registers bxModules.boxexpressauth and
+ * the boxExpressAuth*() BIFs. Needs the boxexpress module loaded alongside it
+ * (routes() builds its router with boxExpressRouter()).
+ */
+class {
+
+	property name="moduleRecord";
+	property name="boxRuntime";
+	property name="log";
+
+	/**
+	 * Module version. Keep in sync with box.json.
+	 */
+	this.version = "0.1.0";
+
+	this.mapping = "boxexpressauth";
+
+	this.author = "Robert Zehnder";
+	this.description = "Pluggable OAuth2 login for BoxExpress apps — a generic authorization-code core with PKCE, and a GitHub provider.";
+	this.webURL = "https://github.com/robertz/boxlang-express-auth";
+	this.disabled = false;
+
+	function configure() {
+		settings = {};
+		objectMappings = {};
+		datasources = {};
+		interceptors = [];
+		customInterceptionPoints = [];
+	}
+
+	function onLoad() {
+	}
+
+	function onUnload() {
+	}
+
+}

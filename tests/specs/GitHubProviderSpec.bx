@@ -1,0 +1,146 @@
+/**
+ * The GitHub provider on its own: profile normalization, email selection,
+ * and the PKCE transform it relies on.
+ */
+class extends="tests.helpers.AuthTestSupport" {
+
+	function run() {
+
+		describe( "PKCE", function() {
+
+			it( "matches the RFC 7636 appendix B test vector", function() {
+				expect( new models.Crypto().s256( "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" ) ).toBe( "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" )
+			} )
+
+			it( "compares strings in constant time and exactly", function() {
+				var crypto = new models.Crypto()
+				expect( crypto.constantTimeEquals( "abc", "abc" ) ).toBeTrue()
+				expect( crypto.constantTimeEquals( "abc", "ABC" ) ).toBeFalse()
+				expect( crypto.constantTimeEquals( "abc", "abcd" ) ).toBeFalse()
+				expect( crypto.constantTimeEquals( "", "" ) ).toBeTrue()
+			} )
+
+		} )
+
+		describe( "fetchProfile()", function() {
+
+			it( "uses the numeric id as a string, never the login", function() {
+				var profile = _provider().fetchProfile( { accessToken: "t" } )
+				expect( profile.id ).toBe( "583231" )
+				expect( profile.username ).toBe( "octocat" )
+			} )
+
+			it( "keeps a large id as plain digits", function() {
+				var profile = _provider( { "GET #variables.USER_URL#": { body: '{"id":9876543210,"login":"big"}' } } ).fetchProfile( { accessToken: "t" } )
+				expect( profile.id ).toBe( "9876543210" )
+			} )
+
+			it( "picks the primary, verified address", function() {
+				var profile = _provider().fetchProfile( { accessToken: "t" } )
+				expect( profile.email ).toBe( "octocat@github.com" )
+				expect( profile.emailVerified ).toBeTrue()
+			} )
+
+			it( "returns a primary but unverified address with emailVerified false", function() {
+				var profile = _provider( { "GET #variables.EMAILS_URL#": { body: [
+					{ email: "verified-secondary@example.com", primary: false, verified: true },
+					{ email: "primary@example.com", primary: true, verified: false }
+				] } } ).fetchProfile( { accessToken: "t" } )
+				expect( profile.email ).toBe( "primary@example.com" )
+				expect( profile.emailVerified ).toBeFalse()
+			} )
+
+			it( "returns an empty email when there are no addresses at all", function() {
+				var profile = _provider( { "GET #variables.EMAILS_URL#": { body: [] } } ).fetchProfile( { accessToken: "t" } )
+				expect( profile.email ).toBe( "" )
+				expect( profile.emailVerified ).toBeFalse()
+			} )
+
+			it( "returns an empty email when no address is primary", function() {
+				var profile = _provider( { "GET #variables.EMAILS_URL#": { body: [ { email: "a@example.com", primary: false, verified: true } ] } } ).fetchProfile( { accessToken: "t" } )
+				expect( profile.email ).toBe( "" )
+				expect( profile.emailVerified ).toBeFalse()
+			} )
+
+			it( "falls back to the public email, unverified, when /user/emails is refused", function() {
+				var profile = _provider( {
+					"GET #variables.USER_URL#": { body: { id: 1, login: "x", email: "public@example.com" } },
+					"GET #variables.EMAILS_URL#": { status: 404, body: { message: "Not Found" } }
+				} ).fetchProfile( { accessToken: "t" } )
+				expect( profile.email ).toBe( "public@example.com" )
+				expect( profile.emailVerified ).toBeFalse()
+			} )
+
+			it( "turns JSON nulls into empty strings", function() {
+				var profile = _provider( { "GET #variables.USER_URL#": { body: '{"id":5,"login":"n","name":null,"avatar_url":null}' } } ).fetchProfile( { accessToken: "t" } )
+				expect( profile.name ).toBe( "" )
+				expect( profile.avatarUrl ).toBe( "" )
+			} )
+
+			it( "fails when /user has no id", function() {
+				var provider = _provider( { "GET #variables.USER_URL#": { body: { login: "noid" } } } )
+				expect( () => provider.fetchProfile( { accessToken: "t" } ) ).toThrow( "BoxExpressAuth.ProfileFailed" )
+			} )
+
+		} )
+
+		describe( "authorizationUrl()", function() {
+
+			it( "sends only the scopes it was configured with", function() {
+				var provider = boxExpressAuthGitHub( {
+					clientId: "c", clientSecret: "s", callbackUrl: variables.CALLBACK_URL,
+					scopes: [ "read:user" ], httpClient: new tests.helpers.FakeHttpClient()
+				} )
+				expect( queryParam( provider.authorizationUrl( "st", repeatString( "v", 43 ), "n", variables.CALLBACK_URL ), "scope" ) ).toBe( "read:user" )
+			} )
+
+			it( "does not send a nonce, which GitHub doesn't use", function() {
+				var location = _provider().authorizationUrl( "st", repeatString( "v", 43 ), "the-nonce", variables.CALLBACK_URL )
+				expect( location ).notToInclude( "the-nonce" )
+			} )
+
+		} )
+
+		describe( "configuration", function() {
+
+			var missing = [ "clientId", "clientSecret", "callbackUrl" ]
+			for ( var key in missing ) {
+				it( title = "throws BoxExpressAuth.InvalidProvider without #key#", data = { key: key }, body = function( data ) {
+					var options = { clientId: "c", clientSecret: "s", callbackUrl: "https://x.test/auth/github/callback" }
+					structDelete( options, data.key )
+					expect( () => boxExpressAuthGitHub( options ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+					options[ data.key ] = "  "
+					expect( () => boxExpressAuthGitHub( options ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				} )
+			}
+
+			it( "throws for a relative callbackUrl", function() {
+				expect( () => boxExpressAuthGitHub( { clientId: "c", clientSecret: "s", callbackUrl: "/auth/github/callback" } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+			it( "doesn't put the client secret in the error message", function() {
+				try {
+					boxExpressAuthGitHub( { clientId: "", clientSecret: "super-secret-value", callbackUrl: variables.CALLBACK_URL } )
+					fail( "expected a throw" )
+				} catch ( "BoxExpressAuth.InvalidProvider" e ) {
+					expect( e.message ).notToInclude( "super-secret-value" )
+				}
+			} )
+
+		} )
+
+	}
+
+	function _provider( struct responses = {} ) {
+		var scripted = githubResponses()
+		scripted.append( responses, true )
+		variables.fake = new tests.helpers.FakeHttpClient( scripted )
+		return boxExpressAuthGitHub( {
+			clientId: "c",
+			clientSecret: "s",
+			callbackUrl: variables.CALLBACK_URL,
+			httpClient: variables.fake
+		} )
+	}
+
+}

@@ -1,0 +1,173 @@
+/**
+ * required(), optional() and POST /auth/logout.
+ */
+class extends="tests.helpers.AuthTestSupport" {
+
+	function run() {
+
+		describe( "required()", function() {
+
+			it( "redirects an anonymous browser navigation to loginPath with returnTo", function() {
+				var app = buildApp()
+				var res = app.inject( { url: "/dashboard?tab=open", headers: { "Accept": "text/html,application/xhtml+xml,*/*;q=0.8" } } )
+				expect( res.statusCode ).toBe( 302 )
+				expect( res.header( "Location" ) ).toBe( "/login?returnTo=%2Fdashboard%3Ftab%3Dopen" )
+			} )
+
+			it( "honors a custom loginPath", function() {
+				var app = buildApp( { loginPath: "/auth/github" } )
+				var res = app.inject( { url: "/dashboard", headers: { "Accept": "text/html" } } )
+				expect( res.header( "Location" ) ).toBe( "/auth/github?returnTo=%2Fdashboard" )
+			} )
+
+			it( "answers 401 JSON to an anonymous API request", function() {
+				var app = buildApp()
+				var res = app.inject( { url: "/dashboard", headers: { "Accept": "application/json" } } )
+				expect( res.statusCode ).toBe( 401 )
+				expect( res.json().code ).toBe( "unauthenticated" )
+			} )
+
+			it( "answers 401 when there is no Accept header at all", function() {
+				expect( buildApp().inject( "/dashboard" ).statusCode ).toBe( 401 )
+			} )
+
+			it( "lets a logged-in request through with req.user from loadUser", function() {
+				var loads = []
+				var app = buildApp( { loadUser: ( id ) => {
+					loads.append( id )
+					return { id: id, name: "Ada" }
+				} } )
+				var flow = completeLogin( app )
+				var res = app.inject( { url: "/dashboard", cookies: flow.finished.cookies } )
+
+				expect( res.statusCode ).toBe( 200 )
+				expect( res.json().user.name ).toBe( "Ada" )
+				expect( res.json().user.id ).toBe( "7" )
+				expect( loads ).toBe( [ "7" ] )
+			} )
+
+			it( "sets req.user to { id } when there is no loadUser", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				var res = app.inject( { url: "/dashboard", cookies: flow.finished.cookies } )
+				expect( res.json().user ).toBe( { id: "7" } )
+			} )
+
+			it( "treats a user loadUser no longer finds as logged out, and clears the id", function() {
+				var app = buildApp( { loadUser: ( id ) => javacast( "null", "" ) } )
+				var flow = completeLogin( app )
+				var res = app.inject( { url: "/dashboard", cookies: flow.finished.cookies } )
+				expect( res.statusCode ).toBe( 401 )
+				expect( sessionOf( app, flow.finished.cookies ).auth ).notToHaveKey( "userId" )
+			} )
+
+			it( "calls loadUser once when optional() and required() both run", function() {
+				var loads = []
+				var app = boxExpress()
+				app.use( boxExpressSession() )
+				variables.fake = new tests.helpers.FakeHttpClient( githubResponses() )
+				var auth = boxExpressAuth( {
+					verify: ( identity, tokens, req ) => { return { id: 1 } },
+					loadUser: ( id ) => {
+						loads.append( id )
+						return { id: id }
+					}
+				} )
+				auth.provider( "github", boxExpressAuthGitHub( { clientId: "c", clientSecret: "s", callbackUrl: variables.CALLBACK_URL, httpClient: variables.fake } ) )
+				app.use( "/auth", auth.routes() )
+				app.use( auth.optional() )
+				app.get( "/both", auth.required(), ( req, res ) => res.json( { id: req.user.id } ) )
+
+				var flow = completeLogin( app )
+				loads.clear()
+				app.inject( { url: "/both", cookies: flow.finished.cookies } )
+				expect( loads ).toHaveLength( 1 )
+			} )
+
+		} )
+
+		describe( "optional()", function() {
+
+			it( "never blocks an anonymous request", function() {
+				var res = buildApp().inject( { url: "/maybe", headers: { "Accept": "text/html" } } )
+				expect( res.statusCode ).toBe( 200 )
+				expect( res.json().user ).toBe( "anonymous" )
+			} )
+
+			it( "sets req.user when logged in", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				expect( app.inject( { url: "/maybe", cookies: flow.finished.cookies } ).json().user.id ).toBe( "7" )
+			} )
+
+			it( "does not hand an anonymous visitor a session just for checking", function() {
+				var app = boxExpress()
+				app.use( boxExpressSession( { saveUninitialized: false } ) )
+				variables.fake = new tests.helpers.FakeHttpClient()
+				var auth = boxExpressAuth( { verify: ( identity, tokens, req ) => { return { id: 1 } } } )
+				app.get( "/maybe", auth.optional(), ( req, res ) => res.send( "ok" ) )
+				expect( app.inject( "/maybe" ).cookies ).toBeEmpty()
+			} )
+
+		} )
+
+		describe( "POST /auth/logout", function() {
+
+			it( "destroys the session and redirects a browser to successRedirect", function() {
+				var app = buildApp( { successRedirect: "/bye" } )
+				var flow = completeLogin( app )
+				var out = app.inject( { method: "POST", url: "/auth/logout", cookies: flow.finished.cookies, headers: { "Accept": "text/html" } } )
+
+				expect( out.statusCode ).toBe( 302 )
+				expect( out.header( "Location" ) ).toBe( "/bye" )
+				expect( app.inject( { url: "/dashboard", cookies: flow.finished.cookies } ).statusCode ).toBe( 401 )
+				expect( sessionOf( app, flow.finished.cookies ) ).notToHaveKey( "auth" )
+			} )
+
+			it( "answers 204 to a non-HTML request", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				var out = app.inject( { method: "POST", url: "/auth/logout", cookies: flow.finished.cookies, headers: { "Accept": "application/json" } } )
+				expect( out.statusCode ).toBe( 204 )
+				expect( app.inject( { url: "/dashboard", cookies: flow.finished.cookies } ).statusCode ).toBe( 401 )
+			} )
+
+			it( "is not routed for GET", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				var res = app.inject( { url: "/auth/logout", cookies: flow.finished.cookies } )
+				expect( res.statusCode ).toBe( 404 )
+				expect( app.inject( { url: "/dashboard", cookies: flow.finished.cookies } ).statusCode ).withContext( "still logged in" ).toBe( 200 )
+			} )
+
+			it( "works behind boxExpressCsrf(), which guards it like any other POST", function() {
+				var app = boxExpress()
+				app.use( boxExpressSession() )
+				app.use( boxExpressUrlencoded() )
+				app.use( boxExpressCsrf() )
+				variables.fake = new tests.helpers.FakeHttpClient( githubResponses() )
+				var auth = boxExpressAuth( { verify: ( identity, tokens, req ) => { return { id: 1 } } } )
+				auth.provider( "github", boxExpressAuthGitHub( { clientId: "c", clientSecret: "s", callbackUrl: variables.CALLBACK_URL, httpClient: variables.fake } ) )
+				app.use( "/auth", auth.routes() )
+				app.get( "/token", ( req, res ) => res.json( { token: req.csrfToken() } ) )
+				app.get( "/me", auth.required(), ( req, res ) => res.json( req.user ) )
+
+				var flow = completeLogin( app )
+				expect( flow.finished.header( "Location" ) ).toBe( "/" )
+				var cookies = flow.finished.cookies
+
+				var withoutToken = app.inject( { method: "POST", url: "/auth/logout", cookies: cookies } )
+				expect( withoutToken.statusCode ).toBe( 403 )
+				expect( app.inject( { url: "/me", cookies: cookies } ).statusCode ).toBe( 200 )
+
+				var token = app.inject( { url: "/token", cookies: cookies } ).json().token
+				var withToken = app.inject( { method: "POST", url: "/auth/logout", cookies: cookies, form: { "_csrf": token } } )
+				expect( withToken.statusCode ).toBe( 204 )
+				expect( app.inject( { url: "/me", cookies: cookies } ).statusCode ).toBe( 401 )
+			} )
+
+		} )
+
+	}
+
+}

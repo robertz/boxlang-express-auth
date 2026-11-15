@@ -1,0 +1,312 @@
+/**
+ * The OAuth round trip through app.inject(): GET /auth/github, then the
+ * callback, with GitHub played by FakeHttpClient.
+ */
+class extends="tests.helpers.AuthTestSupport" {
+
+	function run() {
+
+		describe( "GET /auth/:provider", function() {
+
+			it( "redirects to GitHub with client_id, state, an S256 challenge and the scopes", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var location = started.location
+
+				assertAll( [
+					() => expect( started.response.statusCode ).toBe( 302 ),
+					() => expect( location ).toInclude( "https://github.com/login/oauth/authorize?" ),
+					() => expect( queryParam( location, "client_id" ) ).toBe( "test-client-id" ),
+					() => expect( queryParam( location, "redirect_uri" ) ).toBe( variables.CALLBACK_URL ),
+					() => expect( queryParam( location, "response_type" ) ).toBe( "code" ),
+					() => expect( queryParam( location, "code_challenge_method" ) ).toBe( "S256" ),
+					() => expect( len( queryParam( location, "code_challenge" ) ) ).toBe( 43 ),
+					() => expect( queryParam( location, "scope" ) ).toBe( "read:user user:email" ),
+					() => expect( len( started.state ) ).toBe( 43 )
+				] )
+			} )
+
+			it( "stores the pending state, verifier and returnTo in the session", function() {
+				var app = buildApp()
+				var started = startLogin( app, { returnTo: "/projects/7" } )
+				var pending = sessionOf( app, started.cookies ).auth.pending.github
+				var challenge = queryParam( started.location, "code_challenge" )
+
+				assertAll( [
+					() => expect( pending.state ).toBe( started.state ),
+					() => expect( pending.returnTo ).toBe( "/projects/7" ),
+					() => expect( len( pending.codeVerifier ) ).toBe( 43 ),
+					() => expect( new models.Crypto().s256( pending.codeVerifier ) ).withContext( "the challenge is S256 of the stored verifier" ).toBe( challenge ),
+					() => expect( pending.createdAt ).toBeNumeric()
+				] )
+			} )
+
+			it( "mints a fresh state every time", function() {
+				var app = buildApp()
+				expect( startLogin( app ).state ).notToBe( startLogin( app ).state )
+			} )
+
+			it( "answers 404 for an unknown provider, on start and on callback", function() {
+				var app = buildApp()
+				expect( app.inject( "/auth/gitlab" ).statusCode ).toBe( 404 )
+				expect( app.inject( "/auth/gitlab/callback?code=x&state=y" ).statusCode ).toBe( 404 )
+			} )
+
+		} )
+
+		describe( "the callback, on success", function() {
+
+			it( "calls verify() with the normalized identity and the tokens", function() {
+				var app = buildApp()
+				completeLogin( app )
+
+				expect( variables.verifyCalls ).toHaveLength( 1 )
+				var identity = variables.verifyCalls[ 1 ].identity
+				assertAll( [
+					() => expect( identity.provider ).toBe( "github" ),
+					() => expect( identity.id ).toBeString(),
+					() => expect( identity.id ).toBe( "583231" ),
+					() => expect( identity.username ).toBe( "octocat" ),
+					() => expect( identity.name ).toBe( "The Octocat" ),
+					() => expect( identity.email ).toBe( "octocat@github.com" ),
+					() => expect( identity.emailVerified ).toBeTrue(),
+					() => expect( identity.avatarUrl ).toBe( "https://avatars.githubusercontent.com/u/583231" ),
+					() => expect( identity.raw.login ).toBe( "octocat" ),
+					() => expect( variables.verifyCalls[ 1 ].tokens.accessToken ).toBe( "gho_secret_access_token" )
+				] )
+			} )
+
+			it( "regenerates the session, stores the user id, and redirects to successRedirect", function() {
+				var app = buildApp( { successRedirect: "/home" } )
+				var flow = completeLogin( app )
+				var before = flow.started.cookies[ "connect.sid" ]
+				var after = flow.finished.cookies[ "connect.sid" ] ?: ""
+
+				assertAll( [
+					() => expect( flow.finished.statusCode ).toBe( 302 ),
+					() => expect( flow.finished.header( "Location" ) ).toBe( "/home" ),
+					() => expect( len( after ) ).withContext( "a new session cookie was sent" ).toBe( 64 ),
+					() => expect( compare( after, before ) ).withContext( "the session id changed" ).notToBe( 0 ),
+					() => expect( sessionOf( app, flow.finished.cookies ).auth.userId ).toBe( "7" ),
+					() => expect( sessionOf( app, flow.finished.cookies ).auth ).notToHaveKey( "pending" ),
+					() => expect( sessionOf( app, flow.started.cookies ) ).withContext( "the pre-login session is gone" ).notToHaveKey( "auth" )
+				] )
+			} )
+
+			it( "never puts the provider tokens in the session", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				var stored = jsonSerialize( sessionOf( app, flow.finished.cookies ) )
+				expect( stored ).notToInclude( "gho_secret_access_token" )
+				expect( stored ).notToInclude( "the-code" )
+			} )
+
+			it( "exchanges the code with the stored verifier, the secret, and Accept: application/json", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var verifier = sessionOf( app, started.cookies ).auth.pending.github.codeVerifier
+				callback( app, started.cookies, { code: "the-code", state: started.state } )
+
+				var exchange = variables.fake.callsTo( "POST #variables.TOKEN_URL#" )
+				expect( exchange ).toHaveLength( 1 )
+				assertAll( [
+					() => expect( exchange[ 1 ].headers.Accept ).toBe( "application/json" ),
+					() => expect( exchange[ 1 ].form.code ).toBe( "the-code" ),
+					() => expect( exchange[ 1 ].form.code_verifier ).toBe( verifier ),
+					() => expect( exchange[ 1 ].form.client_id ).toBe( "test-client-id" ),
+					() => expect( exchange[ 1 ].form.client_secret ).toBe( "test-client-secret" ),
+					() => expect( exchange[ 1 ].form.redirect_uri ).toBe( variables.CALLBACK_URL ),
+					() => expect( exchange[ 1 ].form.grant_type ).toBe( "authorization_code" )
+				] )
+			} )
+
+			it( "calls the GitHub API with a bearer token, the GitHub media type and a User-Agent", function() {
+				var app = buildApp()
+				completeLogin( app )
+				var profileCall = variables.fake.callsTo( "GET #variables.USER_URL#" )[ 1 ]
+				assertAll( [
+					() => expect( profileCall.headers.Authorization ).toBe( "Bearer gho_secret_access_token" ),
+					() => expect( profileCall.headers.Accept ).toBe( "application/vnd.github+json" ),
+					() => expect( len( profileCall.headers[ "User-Agent" ] ) ).toBeGT( 0 )
+				] )
+			} )
+
+			it( "hands fetchProfile() the nonce minted for this login", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var nonce = sessionOf( app, started.cookies ).auth.pending.github.nonce
+				var seen = {}
+				var github = variables.auth.getProvider( "github" )
+				github.fetchProfile = ( tokens, context ) => {
+					seen.nonce = context.nonce
+					return { id: "1", email: "", emailVerified: false, name: "", username: "", avatarUrl: "", raw: {} }
+				}
+				callback( app, started.cookies, { code: "the-code", state: started.state } )
+				expect( len( nonce ) ).toBeGT( 0 )
+				expect( seen.nonce ?: "" ).toBe( nonce )
+			} )
+
+			it( "lets a thrown verify() reach the app's error handler instead of a login failure", function() {
+				var app = buildApp( { verify: ( identity, tokens, req ) => { throw( type = "App.DatabaseDown", message = "db down" ) } } )
+				var flow = completeLogin( app )
+				expect( flow.finished.statusCode ).toBe( 500 )
+				expect( flow.finished.json().errorType ).toBe( "App.DatabaseDown" )
+			} )
+
+		} )
+
+		describe( "returnTo", function() {
+
+			it( "is honored for a relative path", function() {
+				var app = buildApp()
+				var flow = completeLogin( app, { returnTo: "/projects/7" } )
+				expect( flow.finished.header( "Location" ) ).toBe( "/projects/7" )
+			} )
+
+			it( "keeps a relative path's query string", function() {
+				var app = buildApp()
+				var flow = completeLogin( app, { returnTo: "/projects/7?tab=issues&sort=new" } )
+				expect( flow.finished.header( "Location" ) ).toBe( "/projects/7?tab=issues&sort=new" )
+			} )
+
+			var attempts = [
+				"https://evil.com",
+				"http://evil.com/path",
+				"//evil.com",
+				"/\evil.com",
+				"/\/evil.com",
+				"\\evil.com",
+				"javascript:alert(1)",
+				"evil.com",
+				"/#char( 9 )#/evil.com",
+				"/#char( 10 )#/evil.com",
+				"/#char( 13 )#/evil.com",
+				"/projects/7\..\..\evil",
+				""
+			]
+			for ( var attempt in attempts ) {
+				it( title = "is ignored for #jsonSerialize( attempt )#", data = { attempt: attempt }, body = function( data ) {
+					var app = buildApp( { successRedirect: "/home" } )
+					var flow = completeLogin( app, { returnTo: data.attempt } )
+					expect( flow.finished.header( "Location" ) ).toBe( "/home" )
+				} )
+			}
+
+		} )
+
+		describe( "the callback fails safely", function() {
+
+			it( "on a wrong state", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var res = callback( app, started.cookies, { code: "the-code", state: "x" & mid( started.state, 2, 42 ) } )
+				expectFailure( res, "invalid_state" )
+				expect( variables.fake.getCalls() ).withContext( "no token exchange is attempted" ).toBeEmpty()
+			} )
+
+			it( "on a missing state", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				expectFailure( callback( app, started.cookies, { code: "the-code" } ), "invalid_state" )
+				expect( variables.fake.getCalls() ).toBeEmpty()
+			} )
+
+			it( "on a callback with no pending login in the session", function() {
+				var app = buildApp()
+				expectFailure( callback( app, {}, { code: "the-code", state: "anything" } ), "invalid_state" )
+			} )
+
+			it( "on a replayed state, even when the first attempt failed", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var first = callback( app, started.cookies, { error: "access_denied", state: started.state } )
+				expectFailure( first, "access_denied" )
+
+				var replay = callback( app, first.cookies.isEmpty() ? started.cookies : first.cookies, { code: "the-code", state: started.state } )
+				expectFailure( replay, "invalid_state" )
+				expect( variables.fake.getCalls() ).toBeEmpty()
+			} )
+
+			it( "on a replayed state after a successful login", function() {
+				var app = buildApp()
+				var flow = completeLogin( app )
+				var replay = callback( app, flow.finished.cookies, { code: "the-code", state: flow.started.state } )
+				expectFailure( replay, "invalid_state" )
+				expect( variables.verifyCalls ).toHaveLength( 1 )
+			} )
+
+			it( "on an expired state", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				app.inject( { url: "/test/age-state", cookies: started.cookies } )
+				expectFailure( callback( app, started.cookies, { code: "the-code", state: started.state } ), "expired_state" )
+				expect( variables.fake.getCalls() ).toBeEmpty()
+			} )
+
+			it( "on ?error=access_denied, removing the pending state", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var res = callback( app, started.cookies, { error: "access_denied", error_description: "The user has denied your application access.", state: started.state } )
+				expectFailure( res, "access_denied" )
+				expect( sessionOf( app, started.cookies ).auth.pending ).notToHaveKey( "github" )
+			} )
+
+			it( "maps any other provider error to provider_error without echoing it", function() {
+				var app = buildApp()
+				var started = startLogin( app )
+				var res = callback( app, started.cookies, { error: "<script>x</script>", state: started.state } )
+				expectFailure( res, "provider_error" )
+			} )
+
+			it( "on a token response of HTTP 200 with an error body", function() {
+				var app = buildApp( {}, { "POST #variables.TOKEN_URL#": { status: 200, body: { error: "bad_verification_code", error_description: "The code passed is incorrect or expired." } } } )
+				var flow = completeLogin( app )
+				expectFailure( flow.finished, "token_exchange_failed" )
+				expect( variables.verifyCalls ).toBeEmpty()
+			} )
+
+			it( "on a token endpoint HTTP error", function() {
+				var app = buildApp( {}, { "POST #variables.TOKEN_URL#": { status: 502, body: "Bad Gateway" } } )
+				expectFailure( completeLogin( app ).finished, "token_exchange_failed" )
+			} )
+
+			it( "on a token endpoint that can't be reached", function() {
+				var app = buildApp( {}, { "POST #variables.TOKEN_URL#": ( options ) => { throw( type = "BoxExpressAuth.HttpError", message = "connection refused" ) } } )
+				expectFailure( completeLogin( app ).finished, "token_exchange_failed" )
+			} )
+
+			it( "on a /user failure", function() {
+				var app = buildApp( {}, { "GET #variables.USER_URL#": { status: 401, body: { message: "Bad credentials" } } } )
+				expectFailure( completeLogin( app ).finished, "profile_failed" )
+				expect( variables.verifyCalls ).toBeEmpty()
+			} )
+
+			it( "when verify() returns null", function() {
+				var app = buildApp( { verify: ( identity, tokens, req ) => javacast( "null", "" ) } )
+				var flow = completeLogin( app )
+				expectFailure( flow.finished, "login_denied" )
+				expect( sessionOf( app, flow.started.cookies ).auth ).notToHaveKey( "userId" )
+			} )
+
+			it( "when verify() returns something without an id", function() {
+				var app = buildApp( { verify: ( identity, tokens, req ) => { return { name: "no id" } } } )
+				expectFailure( completeLogin( app ).finished, "login_denied" )
+			} )
+
+			it( "appends the error code to a failureRedirect that already has a query string", function() {
+				var app = buildApp( { failureRedirect: "/login?from=oauth" } )
+				var started = startLogin( app )
+				var res = callback( app, started.cookies, { error: "access_denied", state: started.state } )
+				expect( res.header( "Location" ) ).toBe( "/login?from=oauth&error=access_denied" )
+			} )
+
+		} )
+
+	}
+
+	function expectFailure( res, required string code ) {
+		expect( res.statusCode ).withContext( res.body ).toBe( 302 )
+		expect( res.header( "Location" ) ).toBe( "/login?error=" & code )
+	}
+
+}

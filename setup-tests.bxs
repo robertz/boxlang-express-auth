@@ -1,0 +1,30 @@
+/**
+ * One-time (per checkout) setup for the test suite: a self-referencing
+ * boxlang_modules/boxexpressauth symlink, so BoxLang loads this checkout as
+ * the module and registers its BIFs. Separate from run-tests.bxs because
+ * modules are discovered once, at process start.
+ *
+ * boxlang_modules/boxexpress comes from `box install` (devDependencies), or
+ * point it at a local boxlang-express checkout by hand:
+ *   ln -s /path/to/boxlang-express boxlang_modules/boxexpress
+ *
+ *   boxlang setup-tests.bxs   (once per checkout)
+ *   boxlang run-tests.bxs     (every time after that)
+ */
+paths = createObject( "java", "java.nio.file.Paths" )
+files = createObject( "java", "java.nio.file.Files" )
+files.createDirectories( paths.get( expandPath( "boxlang_modules" ) ) )
+
+selfLink = paths.get( expandPath( "boxlang_modules/boxexpressauth" ) )
+if ( files.exists( selfLink, [] ) ) {
+	println( "boxlang_modules/boxexpressauth already set up." )
+} else {
+	files.createSymbolicLink( selfLink, paths.get( ".." ) )
+	println( "Created boxlang_modules/boxexpressauth." )
+}
+
+if ( !files.exists( paths.get( expandPath( "boxlang_modules/boxexpress" ) ), [] ) ) {
+	println( "boxlang_modules/boxexpress is missing: run `box install`, or symlink a local boxlang-express checkout there." )
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}
+println( "Run `boxlang run-tests.bxs` now." )

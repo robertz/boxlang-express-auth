@@ -1,0 +1,75 @@
+/**
+ * Runnable GitHub login demo.
+ *
+ *   export GITHUB_CLIENT_ID=...
+ *   export GITHUB_CLIENT_SECRET=...
+ *   export BASE_URL=http://localhost:3000      # optional; must match the OAuth app's callback
+ *   boxlang examples/server.bxs                 # from the repo root (needs boxlang_modules/)
+ *
+ * Register the OAuth app with callback URL  <BASE_URL>/auth/github/callback
+ */
+clientId = getSystemSetting( "GITHUB_CLIENT_ID", "" )
+clientSecret = getSystemSetting( "GITHUB_CLIENT_SECRET", "" )
+baseUrl = getSystemSetting( "BASE_URL", "http://localhost:3000" )
+port = val( getSystemSetting( "PORT", "3000" ) )
+
+if ( !len( clientId ) || !len( clientSecret ) ) {
+	println( "Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET first. Callback URL to register: #baseUrl#/auth/github/callback" )
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}
+
+// Stands in for the app's users + user_identities tables (see README).
+users = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init()
+
+escapeHtml = ( value ) => replaceList( toString( value ), "&,<,>,"",'", "&amp;,&lt;,&gt;,&quot;,&##39;" )
+
+auth = boxExpressAuth( {
+	verify: ( identity, tokens, req ) => {
+		var userId = identity.provider & ":" & identity.id
+		users.put( userId, {
+			id: userId,
+			username: identity.username,
+			name: identity.name,
+			email: identity.email,
+			emailVerified: identity.emailVerified
+		} )
+		return users.get( userId )
+	},
+	loadUser: ( id ) => users.get( id ),
+	successRedirect: "/",
+	failureRedirect: "/",
+	loginPath: "/"
+} )
+auth.provider( "github", boxExpressAuthGitHub( {
+	clientId: clientId,
+	clientSecret: clientSecret,
+	callbackUrl: baseUrl & "/auth/github/callback"
+} ) )
+
+app = boxExpress()
+app.use( boxExpressSession( { resave: false, saveUninitialized: false } ) )
+app.use( boxExpressUrlencoded() )
+app.use( boxExpressCsrf() )
+app.use( "/auth", auth.routes() )
+
+app.get( "/", auth.optional(), ( req, res ) => {
+	var body = "<!doctype html><title>boxlang-express-auth demo</title><h1>boxlang-express-auth demo</h1>"
+	if ( len( req.query.error ?: "" ) ) {
+		body &= "<p style='color:##b00'>Login failed: #escapeHtml( req.query.error )#</p>"
+	}
+	if ( isNull( req.user ) ) {
+		body &= "<p><a href='/auth/github?returnTo=%2Fprivate'>Sign in with GitHub</a></p>"
+	} else {
+		body &= "<p>Signed in as <strong>#escapeHtml( req.user.username )#</strong> (#escapeHtml( req.user.email )#"
+			& ( req.user.emailVerified ? ", verified" : ", unverified" ) & ")</p>"
+			& "<form method='post' action='/auth/logout'><input type='hidden' name='_csrf' value='#escapeHtml( req.csrfToken() )#'><button>Sign out</button></form>"
+	}
+	body &= "<p><a href='/private'>A page that needs login</a></p>"
+	res.type( "text/html" ).send( body )
+} )
+
+app.get( "/private", auth.required(), ( req, res ) => {
+	res.type( "text/html" ).send( "<!doctype html><p>Hello, #escapeHtml( req.user.name ?: req.user.username )#. <a href='/'>Back</a></p>" )
+} )
+
+app.listen( port, ( boundPort ) => println( "Demo on #baseUrl# (port #boundPort#)" ) )

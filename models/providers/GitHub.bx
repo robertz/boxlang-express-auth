@@ -1,0 +1,85 @@
+/**
+ * GitHub OAuth App provider.
+ *
+ * The identity id is GitHub's numeric user id as a string — never the
+ * login, which users can rename (and someone else can then claim).
+ *
+ * GitHub's /user returns only the *public* email, often null, and says
+ * nothing about verification, so /user/emails (scope user:email) is the
+ * source of truth: the primary-and-verified address wins; a primary that
+ * isn't verified comes back with emailVerified: false. If /user/emails
+ * can't be read (scope not granted), the public email is used, unverified.
+ */
+class extends="OAuth2Provider" {
+
+	function init( struct options = {} ) {
+		variables.apiBase = options.apiBase ?: "https://api.github.com"
+		return super.init( options, {
+			name: "github",
+			authorizeUrl: "https://github.com/login/oauth/authorize",
+			tokenUrl: "https://github.com/login/oauth/access_token",
+			scopes: [ "read:user", "user:email" ]
+		} )
+	}
+
+	function fetchProfile( required struct tokens, struct context = {} ) {
+		var apiHeaders = {
+			"Accept": "application/vnd.github+json",
+			"X-GitHub-Api-Version": "2022-11-28"
+		}
+		var user = getJSON( variables.apiBase & "/user", tokens, apiHeaders )
+		if ( !isStruct( user ) || isNull( user.id ) ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "github /user response had no id" )
+		}
+
+		var emails = ""
+		try {
+			emails = getJSON( variables.apiBase & "/user/emails", tokens, apiHeaders )
+		} catch ( "BoxExpressAuth.ProfileFailed" e ) {
+			emails = ""
+		}
+		var chosen = isArray( emails ) ? selectEmail( emails ) : { email: _string( user.email ?: "" ), verified: false }
+
+		return {
+			provider: this.name,
+			id: _integerString( user.id ),
+			email: chosen.email,
+			emailVerified: chosen.verified,
+			name: _string( user.name ?: "" ),
+			username: _string( user.login ?: "" ),
+			avatarUrl: _string( user.avatar_url ?: "" ),
+			raw: user
+		}
+	}
+
+	function selectEmail( required array emails ) {
+		var primary = ""
+		for ( var entry in emails ) {
+			if ( !isStruct( entry ) || !( entry.primary ?: false ) ) {
+				continue
+			}
+			if ( entry.verified ?: false ) {
+				return { email: _string( entry.email ?: "" ), verified: true }
+			}
+			primary = _string( entry.email ?: "" )
+		}
+		return { email: primary, verified: false }
+	}
+
+	/**
+	 * A JSON number can come back as a double (5.83231E5) — go through
+	 * BigDecimal so the id is always plain digits.
+	 */
+	function _integerString( value ) {
+		var asString = toString( value )
+		if ( !reFind( "^[0-9.eE+\-]+$", asString ) ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "github /user id is not numeric" )
+		}
+		return createObject( "java", "java.math.BigDecimal" ).init( asString ).toBigIntegerExact().toString()
+	}
+
+	function _string( value ) {
+		return isSimpleValue( value ) ? toString( value ) : ""
+	}
+
+}

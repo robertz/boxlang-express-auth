@@ -1,0 +1,55 @@
+/**
+ * Stand-in for models/HttpClient: answers from a table of scripted responses
+ * keyed "METHOD url", records every call, and records (then throws on) any
+ * request it wasn't scripted for. Auth turns provider throws into failure
+ * redirects, which would hide that throw — so specs also assert
+ * getUnexpected() is empty after every test.
+ */
+class {
+
+	function init( struct responses = {} ) {
+		variables.responses = responses
+		variables.calls = []
+		variables.unexpected = []
+		return this
+	}
+
+	function respond( required string key, required any response ) {
+		variables.responses[ key ] = response
+		return this
+	}
+
+	function request( required struct options ) {
+		var key = uCase( options.method ?: "GET" ) & " " & options.url
+		variables.calls.append( {
+			method: uCase( options.method ?: "GET" ),
+			url: options.url,
+			headers: options.headers ?: {},
+			form: options.form ?: {}
+		} )
+		if ( !structKeyExists( variables.responses, key ) ) {
+			variables.unexpected.append( key )
+			throw( type = "FakeHttp.UnexpectedRequest", message = "Unscripted request: #key#" )
+		}
+		var scripted = variables.responses[ key ]
+		var response = isCustomFunction( scripted ) || isClosure( scripted ) ? scripted( options ) : scripted
+		return {
+			status: response.status ?: 200,
+			headers: response.headers ?: {},
+			body: isSimpleValue( response.body ?: "" ) ? ( response.body ?: "" ) : jsonSerialize( response.body )
+		}
+	}
+
+	function getCalls() {
+		return variables.calls
+	}
+
+	function callsTo( required string key ) {
+		return variables.calls.filter( ( call ) => compare( call.method & " " & call.url, key ) == 0 )
+	}
+
+	function getUnexpected() {
+		return variables.unexpected
+	}
+
+}

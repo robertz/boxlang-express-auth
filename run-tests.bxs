@@ -1,0 +1,20 @@
+/**
+ * Runs the suite headlessly and exits non-zero on any failure or error.
+ *   boxlang run-tests.bxs
+ */
+files = createObject( "java", "java.nio.file.Files" )
+paths = createObject( "java", "java.nio.file.Paths" )
+for ( required in [ "boxlang_modules/boxexpressauth", "boxlang_modules/boxexpress", "testbox" ] ) {
+	if ( !files.exists( paths.get( expandPath( required ) ), [] ) ) {
+		println( "#required# is missing. Run `box install`, then `boxlang setup-tests.bxs`, then this again." )
+		createObject( "java", "java.lang.System" ).exit( 1 )
+	}
+}
+
+tb = new "testbox.system.TestBox"( directory = "tests.specs", reporter = "text" )
+println( tb.run() )
+
+result = tb.getResult()
+if ( result.getTotalFail() > 0 || result.getTotalError() > 0 ) {
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}

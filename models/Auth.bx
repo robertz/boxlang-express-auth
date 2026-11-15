@@ -1,0 +1,356 @@
+/**
+ * Third-party login for BoxExpress apps: the routes that run an OAuth2
+ * authorization-code flow against a registered provider, and the guards
+ * that read the result back on later requests.
+ *
+ *   auth = boxExpressAuth( {
+ *     verify: ( identity, tokens, req ) => users.findOrCreate( identity ),
+ *     loadUser: ( id ) => users.get( id )
+ *   } )
+ *   auth.provider( "github", boxExpressAuthGitHub( { ... } ) )
+ *
+ *   app.use( boxExpressSession() )
+ *   app.use( "/auth", auth.routes() )
+ *   app.get( "/dashboard", auth.required(), handler )
+ *
+ * What lives in the session (under options.sessionKey, default "auth"):
+ *
+ *   pending[ providerName ] = { state, codeVerifier, nonce, returnTo, createdAt }
+ *     between GET /auth/:provider and its callback. Single-use: removed on
+ *     the callback before anything else is checked.
+ *   userId = "<what verify() returned as id>"
+ *     after a successful login, in a freshly regenerated session.
+ *
+ * Provider tokens are never stored: verify() gets them, then they go out
+ * of scope with the request.
+ *
+ * Every function a route closure calls is public on purpose — BoxLang can't
+ * reach a private method from a closure the router invokes later.
+ */
+class {
+
+	variables.FAILURE_CODES = [
+		"access_denied",
+		"provider_error",
+		"invalid_state",
+		"expired_state",
+		"token_exchange_failed",
+		"profile_failed",
+		"login_denied"
+	]
+	variables.RESERVED_NAMES = [ "logout" ]
+
+	function init( struct options = {} ) {
+		if ( !isCustomFunction( options.verify ?: "" ) && !isClosure( options.verify ?: "" ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidConfig",
+				message = "boxExpressAuth() needs a verify( identity, tokens, req ) function that maps a provider identity to your user — return a struct with an id, or null to refuse the login"
+			)
+		}
+		if ( structKeyExists( options, "loadUser" ) && !isCustomFunction( options.loadUser ) && !isClosure( options.loadUser ) ) {
+			throw( type = "BoxExpressAuth.InvalidConfig", message = "boxExpressAuth() loadUser must be a function( id )" )
+		}
+
+		variables.verifyFn = options.verify
+		variables.loadUserFn = options.loadUser ?: ""
+		variables.successRedirect = options.successRedirect ?: "/"
+		variables.failureRedirect = options.failureRedirect ?: "/login"
+		variables.loginPath = options.loginPath ?: "/login"
+		variables.sessionKey = options.sessionKey ?: "auth"
+		variables.stateTtlMs = ( options.stateTtlSeconds ?: 600 ) * 1000
+		variables.providers = {}
+		variables.crypto = new "Crypto"()
+		return this
+	}
+
+	/**
+	 * Registers a provider under the name used in its URLs
+	 * (/auth/<name>, /auth/<name>/callback). Register before listen().
+	 */
+	function provider( required string name, required any providerInstance ) {
+		if ( !reFind( "^[a-z0-9][a-z0-9_-]{0,31}$", name ) || variables.RESERVED_NAMES.findNoCase( name ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "Provider name '#name#' must be lower-case letters, digits, - or _, and not one of: #variables.RESERVED_NAMES.toList( ', ' )#"
+			)
+		}
+		if ( structKeyExists( variables.providers, name ) ) {
+			throw( type = "BoxExpressAuth.DuplicateProvider", message = "A provider named '#name#' is already registered" )
+		}
+		for ( var member in [ "authorizationUrl", "exchangeCode", "fetchProfile", "callbackUrl" ] ) {
+			if ( !structKeyExists( providerInstance, member ) ) {
+				throw( type = "BoxExpressAuth.InvalidProvider", message = "Provider '#name#' is missing #member# — see docs/providers.md for the contract" )
+			}
+		}
+		variables.providers[ name ] = providerInstance
+		return this
+	}
+
+	/**
+	 * GET /:provider, GET /:provider/callback and POST /logout, as a router
+	 * to mount wherever the provider callbackUrls point (usually /auth).
+	 */
+	function routes() {
+		var self = this
+		var router = boxExpressRouter()
+
+		router.post( "/logout", ( req, res, next ) => self.handleLogout( req, res ) )
+		router.get( "/:provider", ( req, res, next ) => self.handleStart( req, res ) )
+		router.get( "/:provider/callback", ( req, res, next ) => self.handleCallback( req, res ) )
+
+		return router
+	}
+
+	/**
+	 * Route guard. Anonymous browser navigations go to loginPath with a
+	 * returnTo; anything else gets a 401 JSON body.
+	 */
+	function required() {
+		var self = this
+		return ( req, res, next ) => {
+			self.assertSession( req )
+			if ( self.populateUser( req ) ) {
+				return next()
+			}
+			if ( self.wantsHtml( req ) ) {
+				return res.redirect( self.loginUrl( req.originalUrl ) )
+			}
+			return res.status( 401 ).json( { error: true, code: "unauthenticated", message: "Authentication required" } )
+		}
+	}
+
+	/**
+	 * Sets req.user when there is a logged-in user; never blocks.
+	 */
+	function optional() {
+		var self = this
+		return ( req, res, next ) => {
+			self.assertSession( req )
+			self.populateUser( req )
+			return next()
+		}
+	}
+
+	function handleStart( req, res ) {
+		var selected = getProvider( req.params.provider )
+		if ( isSimpleValue( selected ) ) {
+			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
+		}
+		assertSession( req )
+
+		var state = variables.crypto.randomToken( 32 )
+		var codeVerifier = variables.crypto.randomToken( 32 )
+		var nonce = variables.crypto.randomToken( 16 )
+
+		var bucket = sessionBucket( req, true )
+		if ( !isStruct( bucket.pending ?: "" ) ) {
+			bucket.pending = {}
+		}
+		bucket.pending[ selected.name ] = {
+			state: state,
+			codeVerifier: codeVerifier,
+			nonce: nonce,
+			returnTo: safeReturnTo( req.query.returnTo ?: "" ),
+			createdAt: variables.crypto.nowMs()
+		}
+
+		res.set( "Cache-Control", "no-store" )
+		return res.redirect( selected.authorizationUrl( state, codeVerifier, nonce, selected.callbackUrl ) )
+	}
+
+	function handleCallback( req, res ) {
+		var selected = getProvider( req.params.provider )
+		if ( isSimpleValue( selected ) ) {
+			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
+		}
+		assertSession( req )
+		res.set( "Cache-Control", "no-store" )
+
+		// Taken out before any check, so the state is spent whether this
+		// callback succeeds, fails, or throws.
+		var bucket = sessionBucket( req, false )
+		var pendingAll = isStruct( bucket.pending ?: "" ) ? bucket.pending : {}
+		var pending = pendingAll[ selected.name ] ?: ""
+		structDelete( pendingAll, selected.name )
+
+		var providerError = req.query.error ?: ""
+		if ( !isSimpleValue( providerError ) || len( providerError ) ) {
+			return fail( res, selected.name, compare( providerError, "access_denied" ) == 0 ? "access_denied" : "provider_error" )
+		}
+
+		var returnedState = req.query.state ?: ""
+		if ( !isStruct( pending ) || !isSimpleValue( returnedState ) || !len( returnedState ) || !variables.crypto.constantTimeEquals( returnedState, pending.state ) ) {
+			return fail( res, selected.name, "invalid_state" )
+		}
+		if ( variables.crypto.nowMs() - pending.createdAt > variables.stateTtlMs ) {
+			return fail( res, selected.name, "expired_state" )
+		}
+
+		var code = req.query.code ?: ""
+		if ( !isSimpleValue( code ) || !len( code ) ) {
+			return fail( res, selected.name, "provider_error" )
+		}
+
+		var tokens = {}
+		try {
+			tokens = selected.exchangeCode( code, pending.codeVerifier, selected.callbackUrl )
+		} catch ( any e ) {
+			return fail( res, selected.name, "token_exchange_failed", e )
+		}
+
+		var identity = {}
+		try {
+			identity = selected.fetchProfile( tokens, { nonce: pending.nonce } )
+		} catch ( any e ) {
+			return fail( res, selected.name, "profile_failed", e )
+		}
+		if ( !isStruct( identity ) || !isSimpleValue( identity.id ?: "" ) || !len( identity.id ?: "" ) ) {
+			return fail( res, selected.name, "profile_failed" )
+		}
+		identity.provider = selected.name
+		identity.id = toString( identity.id )
+
+		// verify() and loadUser() are app code: if they throw, that's an app
+		// fault (a database being down, say) and goes to the app's error
+		// handler as a 500 rather than being dressed up as a failed login.
+		var verified = { user: variables.verifyFn( identity, tokens, req ) }
+		if ( isNull( verified.user ) || !isStruct( verified.user ) || !isSimpleValue( verified.user.id ?: "" ) || !len( verified.user.id ?: "" ) ) {
+			return fail( res, selected.name, "login_denied" )
+		}
+
+		// New id before the session becomes authenticated, so an id planted
+		// in the browser beforehand (session fixation) never gets a login.
+		req.regenerateSession()
+		bucket = sessionBucket( req, true )
+		structDelete( bucket, "pending" )
+		bucket.userId = toString( verified.user.id )
+		req.user = verified.user
+
+		return res.redirect( len( pending.returnTo ) ? pending.returnTo : variables.successRedirect )
+	}
+
+	function handleLogout( req, res ) {
+		assertSession( req )
+		req.destroySession()
+		if ( wantsHtml( req ) ) {
+			return res.redirect( variables.successRedirect )
+		}
+		return res.status( 204 ).end()
+	}
+
+	/**
+	 * True when the session holds a logged-in user; sets req.user. A user id
+	 * that loadUser() no longer recognises (deleted account) is cleared, so
+	 * the request carries on as anonymous.
+	 */
+	function populateUser( req ) {
+		if ( !isNull( req.user ) ) {
+			return true
+		}
+		var bucket = sessionBucket( req, false )
+		var userId = bucket.userId ?: ""
+		if ( !isSimpleValue( userId ) || !len( userId ) ) {
+			return false
+		}
+		if ( isSimpleValue( variables.loadUserFn ) ) {
+			req.user = { id: userId }
+			return true
+		}
+		var loaded = { user: variables.loadUserFn( userId ) }
+		if ( isNull( loaded.user ) ) {
+			structDelete( bucket, "userId" )
+			return false
+		}
+		req.user = loaded.user
+		return true
+	}
+
+	/**
+	 * A relative path on this site, or "" — never anything a browser could
+	 * resolve to another origin. "//host" and "/\host" are both
+	 * protocol-relative to browsers, and browsers strip tab/CR/LF out of
+	 * URLs before parsing, so "/<TAB>/host" becomes "//host": any backslash
+	 * or control character rejects the value outright.
+	 */
+	function safeReturnTo( value ) {
+		if ( !isSimpleValue( value ) ) {
+			return ""
+		}
+		var candidate = toString( value )
+		if ( len( candidate ) == 0 || len( candidate ) > 2048 ) {
+			return ""
+		}
+		if ( compare( mid( candidate, 1, 1 ), "/" ) != 0 ) {
+			return ""
+		}
+		if ( len( candidate ) > 1 && compare( mid( candidate, 2, 1 ), "/" ) == 0 ) {
+			return ""
+		}
+		if ( find( "\", candidate ) || reFind( "[\x00-\x1F\x7F]", candidate ) ) {
+			return ""
+		}
+		return candidate
+	}
+
+	function loginUrl( required string originalUrl ) {
+		var returnTo = safeReturnTo( originalUrl )
+		if ( !len( returnTo ) ) {
+			return variables.loginPath
+		}
+		return variables.loginPath & ( find( "?", variables.loginPath ) ? "&" : "?" ) & "returnTo=" & createObject( "java", "java.net.URLEncoder" ).encode( returnTo, "UTF-8" )
+	}
+
+	function wantsHtml( req ) {
+		var accept = req.get( "Accept" ) ?: ""
+		return findNoCase( "text/html", accept ) > 0
+	}
+
+	function fail( res, required string providerName, required string code, any cause ) {
+		var detail = isNull( cause ) ? "" : " (#cause.type ?: 'error'#: #cause.message ?: ''#)"
+		println( "[BoxExpressAuth] #providerName# login failed: #code##detail#" )
+		var target = variables.failureRedirect & ( find( "?", variables.failureRedirect ) ? "&" : "?" ) & "error=" & code
+		return res.redirect( target )
+	}
+
+	function assertSession( req ) {
+		if ( isNull( req.session ) || isNull( req.regenerateSession ) || isNull( req.destroySession ) ) {
+			throw(
+				type = "BoxExpressAuth.SessionRequired",
+				message = "boxExpressAuth needs req.session — register app.use( boxExpressSession() ) before the auth routes and guards"
+			)
+		}
+	}
+
+	/**
+	 * The auth struct inside req.session. With create = false, an absent
+	 * one comes back as a detached empty struct, so a read never marks an
+	 * anonymous session as changed (saveUninitialized: false stays cheap).
+	 */
+	function sessionBucket( req, boolean create = false ) {
+		if ( isStruct( req.session[ variables.sessionKey ] ?: "" ) ) {
+			return req.session[ variables.sessionKey ]
+		}
+		if ( !create ) {
+			return {}
+		}
+		req.session[ variables.sessionKey ] = {}
+		return req.session[ variables.sessionKey ]
+	}
+
+	function getProvider( name ) {
+		if ( !isSimpleValue( name ) ) {
+			return ""
+		}
+		for ( var registered in variables.providers ) {
+			if ( compare( registered, name ) == 0 ) {
+				return variables.providers[ registered ]
+			}
+		}
+		return ""
+	}
+
+	function getFailureCodes() {
+		return duplicate( variables.FAILURE_CODES )
+	}
+
+}

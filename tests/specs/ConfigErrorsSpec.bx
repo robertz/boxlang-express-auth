@@ -1,0 +1,58 @@
+/**
+ * Misconfiguration fails loudly, with a typed error, at the earliest point
+ * it can be detected.
+ */
+class extends="tests.helpers.AuthTestSupport" {
+
+	function run() {
+
+		describe( "configuration errors", function() {
+
+			it( "throws BoxExpressAuth.SessionRequired when session middleware isn't registered", function() {
+				var app = buildApp( withSession = false )
+				var res = app.inject( "/auth/github" )
+				expect( res.statusCode ).toBe( 500 )
+				expect( res.json().errorType ).toBe( "BoxExpressAuth.SessionRequired" )
+				expect( res.json().message ).toInclude( "boxExpressSession()" )
+			} )
+
+			it( "throws BoxExpressAuth.SessionRequired from the guards too", function() {
+				var app = buildApp( withSession = false )
+				expect( app.inject( "/dashboard" ).json().errorType ).toBe( "BoxExpressAuth.SessionRequired" )
+				expect( app.inject( "/maybe" ).json().errorType ).toBe( "BoxExpressAuth.SessionRequired" )
+			} )
+
+			it( "throws BoxExpressAuth.InvalidConfig without verify()", function() {
+				expect( () => boxExpressAuth( {} ) ).toThrow( "BoxExpressAuth.InvalidConfig" )
+				expect( () => boxExpressAuth( { verify: "not a function" } ) ).toThrow( "BoxExpressAuth.InvalidConfig" )
+			} )
+
+			it( "throws BoxExpressAuth.InvalidConfig for a loadUser that isn't a function", function() {
+				expect( () => boxExpressAuth( { verify: ( i, t, r ) => i, loadUser: "users" } ) ).toThrow( "BoxExpressAuth.InvalidConfig" )
+			} )
+
+			it( "throws BoxExpressAuth.DuplicateProvider for a second provider of the same name", function() {
+				var auth = boxExpressAuth( { verify: ( i, t, r ) => i } )
+				var github = boxExpressAuthGitHub( { clientId: "c", clientSecret: "s", callbackUrl: variables.CALLBACK_URL } )
+				auth.provider( "github", github )
+				expect( () => auth.provider( "github", github ) ).toThrow( "BoxExpressAuth.DuplicateProvider" )
+			} )
+
+			it( "rejects provider names that can't be a URL segment, or that collide with /logout", function() {
+				var auth = boxExpressAuth( { verify: ( i, t, r ) => i } )
+				var github = boxExpressAuthGitHub( { clientId: "c", clientSecret: "s", callbackUrl: variables.CALLBACK_URL } )
+				for ( var badName in [ "logout", "Git Hub", "", "a/b", "GitHub" ] ) {
+					expect( () => auth.provider( badName, github ) ).withContext( badName ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				}
+			} )
+
+			it( "rejects a provider object missing part of the contract", function() {
+				var auth = boxExpressAuth( { verify: ( i, t, r ) => i } )
+				expect( () => auth.provider( "partial", { authorizationUrl: () => "", callbackUrl: "https://x.test" } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+		} )
+
+	}
+
+}
