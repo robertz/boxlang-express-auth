@@ -2,8 +2,9 @@
  * Base class for OAuth2 authorization-code providers. Handles the parts
  * every such provider shares: option validation, building the authorize URL
  * (always with PKCE S256), and exchanging the code at the token endpoint.
- * A subclass supplies its endpoints through init()'s defaults and implements
- * fetchProfile().
+ * A subclass supplies its endpoints through init()'s defaults (or, with
+ * discoverEndpoints: true, overrides getAuthorizeUrl()/getTokenUrl() to find
+ * them later) and implements fetchProfile().
  *
  * The provider contract Auth relies on — anything with these members works,
  * whether or not it extends this class:
@@ -11,7 +12,7 @@
  *   name
  *   callbackUrl
  *   authorizationUrl( state, codeVerifier, nonce, callbackUrl ) → string
- *   exchangeCode( code, codeVerifier, callbackUrl )              → { accessToken, tokenType, scope }
+ *   exchangeCode( code, codeVerifier, callbackUrl )              → { accessToken, tokenType, scope[, idToken] }
  *   fetchProfile( tokens, context ) → { provider, id, email, emailVerified, name, username, avatarUrl, raw }
  *     context = { nonce } — the nonce minted for this login, for providers
  *     that must check it (OIDC id_token); plain OAuth2 ignores it.
@@ -22,9 +23,11 @@
  */
 class {
 
+	variables.RESERVED_PARAMS = [ "response_type", "client_id", "redirect_uri", "state", "code_challenge", "code_challenge_method", "scope", "nonce" ]
+
 	/**
-	 * @options  what the app passed in (clientId, clientSecret, callbackUrl, scopes, httpClient, userAgent)
-	 * @defaults what the subclass fixes (name, authorizeUrl, tokenUrl, scopes)
+	 * @options  what the app passed in (clientId, clientSecret, callbackUrl, scopes, authorizeParams, httpClient, userAgent)
+	 * @defaults what the subclass fixes (name, authorizeUrl, tokenUrl, scopes, discoverEndpoints)
 	 */
 	function init( struct options = {}, struct defaults = {} ) {
 		var merged = structCopy( defaults )
@@ -49,7 +52,7 @@ class {
 			)
 		}
 		for ( var endpoint in [ "authorizeUrl", "tokenUrl" ] ) {
-			if ( !len( merged[ endpoint ] ?: "" ) ) {
+			if ( !( merged.discoverEndpoints ?: false ) && !len( merged[ endpoint ] ?: "" ) ) {
 				throw(
 					type = "BoxExpressAuth.InvalidProvider",
 					message = "The #providerLabel# provider has no #endpoint#"
@@ -57,10 +60,24 @@ class {
 			}
 		}
 
+		var extraParams = merged.authorizeParams ?: {}
+		if ( !isStruct( extraParams ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The #providerLabel# provider's authorizeParams must be a struct" )
+		}
+		for ( var paramName in extraParams ) {
+			if ( variables.RESERVED_PARAMS.findNoCase( paramName ) ) {
+				throw(
+					type = "BoxExpressAuth.InvalidProvider",
+					message = "The #providerLabel# provider's authorizeParams can't set #paramName# — the login flow owns it"
+				)
+			}
+		}
+
 		variables.clientId = merged.clientId
 		variables.clientSecret = merged.clientSecret
-		variables.authorizeUrl = merged.authorizeUrl
-		variables.tokenUrl = merged.tokenUrl
+		variables.authorizeUrl = merged.authorizeUrl ?: ""
+		variables.tokenUrl = merged.tokenUrl ?: ""
+		variables.authorizeParams = extraParams
 		variables.scopes = merged.scopes ?: []
 		variables.scopeSeparator = merged.scopeSeparator ?: " "
 		variables.userAgent = merged.userAgent ?: "boxlang-express-auth"
@@ -82,7 +99,19 @@ class {
 			params.append( [ "scope", arrayToList( variables.scopes, variables.scopeSeparator ) ] )
 		}
 		params.append( authorizationParams( nonce ), true )
-		return variables.authorizeUrl & ( find( "?", variables.authorizeUrl ) ? "&" : "?" ) & encodeQuery( params )
+		for ( var paramName in variables.authorizeParams ) {
+			params.append( [ lCase( paramName ), toString( variables.authorizeParams[ paramName ] ) ] )
+		}
+		var endpoint = getAuthorizeUrl()
+		return endpoint & ( find( "?", endpoint ) ? "&" : "?" ) & encodeQuery( params )
+	}
+
+	function getAuthorizeUrl() {
+		return variables.authorizeUrl
+	}
+
+	function getTokenUrl() {
+		return variables.tokenUrl
 	}
 
 	/**
@@ -96,7 +125,7 @@ class {
 	function exchangeCode( required string code, required string codeVerifier, string callbackUrl = this.callbackUrl ) {
 		var response = variables.httpClient.request( {
 			method: "POST",
-			url: variables.tokenUrl,
+			url: getTokenUrl(),
 			headers: {
 				"Accept": "application/json",
 				"User-Agent": variables.userAgent
@@ -132,11 +161,15 @@ class {
 				message = "#this.name# token endpoint response had no access_token"
 			)
 		}
-		return {
+		var tokens = {
 			accessToken: payload.access_token,
 			tokenType: payload.token_type ?: "bearer",
 			scope: payload.scope ?: ""
 		}
+		if ( isSimpleValue( payload.id_token ?: "" ) && len( payload.id_token ?: "" ) ) {
+			tokens.idToken = payload.id_token
+		}
+		return tokens
 	}
 
 	function fetchProfile( required struct tokens, struct context = {} ) {

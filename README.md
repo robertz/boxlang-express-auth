@@ -1,13 +1,14 @@
 # boxlang-express-auth
 
 Pluggable third-party login for [BoxExpress](https://github.com/robertz/boxlang-express)
-apps: a generic OAuth2 authorization-code core (always PKCE `S256`) and a
-GitHub provider. Your app decides who a provider identity *is*; this module
+apps: a generic OAuth2 authorization-code core (always PKCE `S256`), a
+generic OpenID Connect provider, and presets for GitHub and Google. Your
+app decides who a provider identity *is*; this module
 runs the flow, guards routes, and keeps the session honest.
 
 - Requires BoxLang ≥ 1.15 and the `boxexpress` module (0.2.26+).
-- Not in v0.1: OIDC providers (Google, Keycloak, Authelia — next), refresh
-  tokens, token storage, account-linking UI, password login, API tokens.
+- Not included: refresh tokens, token storage, account-linking UI, password
+  login, API tokens, ID-token algorithms other than RS256/RS384/RS512.
 
 ## Install
 
@@ -111,11 +112,11 @@ provider's own error text is never echoed:
 | Code | Meaning |
 |---|---|
 | `access_denied` | The user declined on the provider's consent screen. |
-| `provider_error` | The provider sent back any other error, or no code. |
+| `provider_error` | The provider sent back any other error or no code — or, on `GET /auth/:provider`, an OIDC issuer's discovery document couldn't be read. |
 | `invalid_state` | State missing, wrong, already used, or no login was pending in this session. |
 | `expired_state` | Took longer than 10 minutes. |
 | `token_exchange_failed` | The provider refused the code (GitHub: HTTP 200 with an `error` body). |
-| `profile_failed` | The profile couldn't be read. |
+| `profile_failed` | The profile couldn't be read, or an OIDC ID token failed validation (the log says which check). |
 | `login_denied` | `verify()` returned null. |
 
 The reason is logged server-side (`[BoxExpressAuth] github login failed: …`),
@@ -127,7 +128,7 @@ never with codes, tokens or the client secret.
 |---|---|
 | `BoxExpressAuth.SessionRequired` | A request reached the auth routes or a guard without `boxExpressSession()` in front. |
 | `BoxExpressAuth.InvalidConfig` | No `verify` function, or `loadUser` isn't one. |
-| `BoxExpressAuth.InvalidProvider` | Missing `clientId`/`clientSecret`/`callbackUrl`, a relative `callbackUrl`, or a bad provider name. |
+| `BoxExpressAuth.InvalidProvider` | Missing `clientId`/`clientSecret`/`callbackUrl`, a relative `callbackUrl`, a bad provider name, an `authorizeParams` key the flow owns, or (OIDC) a missing or plain-http issuer or no `openid` scope. |
 | `BoxExpressAuth.DuplicateProvider` | Two providers registered under one name. |
 
 ### Options
@@ -142,8 +143,12 @@ never with codes, tokens or the client secret.
 | `sessionKey` | `"auth"` | Key under `req.session` this module owns |
 | `stateTtlSeconds` | `600` | |
 
-GitHub provider: `clientId`, `clientSecret`, `callbackUrl` (all required),
-`scopes`, `userAgent` (default `boxlang-express-auth`), `httpClient`.
+Every provider takes `clientId`, `clientSecret`, `callbackUrl` (all
+required), `scopes`, `authorizeParams` (extra authorize-URL parameters such
+as `{ prompt: "select_account" }`; the flow's own — `state`, `nonce`,
+`scope`, `redirect_uri`, PKCE — can't be overridden), `userAgent` (default
+`boxlang-express-auth`) and `httpClient`. OIDC and Google add the options in
+their sections below.
 
 ## Registering a GitHub OAuth app
 
@@ -163,6 +168,101 @@ GitHub provider: `clientId`, `clientSecret`, `callbackUrl` (all required),
 GitHub supports PKCE for OAuth apps (`S256` only); this module always sends
 it. The default scopes are `read:user` and `user:email` — the latter is what
 lets the provider see private addresses and whether they're verified.
+
+## Google
+
+```js
+auth.provider( "google", boxExpressAuthGoogle( {
+	clientId: getSystemSetting( "GOOGLE_CLIENT_ID" ),
+	clientSecret: getSystemSetting( "GOOGLE_CLIENT_SECRET" ),
+	callbackUrl: "https://tracker.example.com/auth/google/callback",
+	hostedDomain: "example.com"        // optional — see below
+} ) )
+```
+
+Link to `/auth/google`. Scopes default to `openid email profile`. The
+identity's `id` is Google's `sub` (a long numeric string); `username` is
+always `""` because Google has none; `avatarUrl` is the `picture` claim.
+
+**`hostedDomain`** limits sign-in to one Google Workspace domain. It's sent
+as Google's `hd` parameter — which only pre-selects the account and can be
+removed by the user — and then **enforced** against the `hd` claim inside
+the signed ID token. `"*"` accepts any Workspace account but no consumer
+`@gmail.com` one. Don't restrict by the email's domain instead: Google says
+to use `hd` for that.
+
+### Registering a Google OAuth client
+
+1. [Google Cloud console](https://console.cloud.google.com/) → pick or create
+   a project → **APIs & Services → OAuth consent screen**. Choose *Internal*
+   (Workspace users only) or *External*, add the `openid`, `email` and
+   `profile` scopes, and add test users while the app is in testing.
+2. **APIs & Services → Credentials → Create credentials → OAuth client ID**,
+   application type **Web application**.
+3. **Authorized redirect URIs**: exactly the provider's `callbackUrl` —
+   `https://tracker.example.com/auth/google/callback`. Add
+   `http://localhost:3000/auth/google/callback` to a separate dev client
+   rather than the production one.
+4. Put the client ID and secret in the environment (`GOOGLE_CLIENT_ID`,
+   `GOOGLE_CLIENT_SECRET`).
+
+## Any OpenID Connect provider (Keycloak, Authelia, …)
+
+```js
+auth.provider( "keycloak", boxExpressAuthOIDC( {
+	name: "keycloak",
+	issuer: "https://sso.example.com/realms/tracker",
+	clientId: getSystemSetting( "OIDC_CLIENT_ID" ),
+	clientSecret: getSystemSetting( "OIDC_CLIENT_SECRET" ),
+	callbackUrl: "https://tracker.example.com/auth/keycloak/callback"
+} ) )
+```
+
+The provider reads `<issuer>/.well-known/openid-configuration` on the first
+login (not at startup, so the app boots while the IdP is down), sends a
+`nonce` with every login, and validates the ID token before `verify()` sees
+anything:
+
+- the signature, against the issuer's JWKS — RS256, RS384 or RS512 with a
+  key of at least 2048 bits; `none` and HMAC are refused. The key set is
+  cached and refetched once when a token names an unknown `kid` (a key
+  rotation), at most every `jwksMinRefreshSeconds` (default 60).
+- `iss` is the configured issuer, and the discovery document names that
+  same issuer.
+- `aud` contains `clientId`; `azp`, when present (or when there are several
+  audiences), is `clientId`.
+- `exp` hasn't passed and `iat` isn't in the future, give or take
+  `clockSkewSeconds` (default 60).
+- `nonce` is the one minted for this login.
+
+The identity's `id` is `sub`; `username` is `preferred_username`;
+`emailVerified` is `email_verified` (the string `"true"` counts). When the
+ID token has no email, the userinfo endpoint is read as well — its `sub`
+must match, and it never overrides a signed ID-token claim.
+
+| Option | Default | |
+|---|---|---|
+| `issuer` | — | Required. https, or http on `localhost`/`127.0.0.1`/`[::1]` only |
+| `name` | `"oidc"` | Register under the same name you use here |
+| `scopes` | `[ "openid", "email", "profile" ]` | Must include `openid` |
+| `userinfo` | `"auto"` | `"auto"` (when the ID token lacks an email), `"always"`, `"never"` |
+| `clockSkewSeconds` | `60` | |
+| `jwksMinRefreshSeconds` | `60` | |
+| `acceptedIssuers` | `[ issuer ]` | Extra `iss` spellings (Google uses this) |
+| `algorithms` | `[ "RS256", "RS384", "RS512" ]` | Narrow it, never widen it |
+| `authorizeUrl`, `tokenUrl`, `jwksUri`, `userinfoUrl` | discovered | Give the first three to skip discovery |
+
+`tokens` passed to `verify()` includes `idToken` for OIDC providers —
+useful later as an `id_token_hint` for RP-initiated logout. It isn't stored.
+
+Keycloak: create a confidential client (*Client authentication* on, *Standard
+flow* on), set the redirect URI, and use
+`https://<host>/realms/<realm>` as the issuer. Authelia: register the client
+under `identity_providers.oidc.clients` with `authorization_policy`,
+`redirect_uris`, `scopes: [ openid, email, profile ]` and
+`require_pkce: true`, `pkce_challenge_method: S256`; the issuer is
+Authelia's own URL. Authelia often leaves email out of the ID token, which
+is what `userinfo: "auto"` covers.
 
 ### Behind a proxy, and cookies
 
@@ -189,7 +289,8 @@ The identity passed to `verify()`:
 ```
 
 `id` is the provider's stable user id, as a string — for GitHub, the numeric
-id, not the login (logins can be renamed, and then claimed by someone else).
+id, not the login (logins can be renamed, and then claimed by someone else);
+for Google and OIDC, the `sub` claim.
 Store identities in their own table, linked to your users:
 
 ```sql

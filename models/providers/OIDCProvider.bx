@@ -1,0 +1,336 @@
+/**
+ * Generic OpenID Connect provider (authorization code + PKCE). Point it at
+ * an issuer; it reads the issuer's discovery document on first use, sends a
+ * nonce, and validates the returned ID token before building the identity:
+ *
+ *   - signature, against the issuer's JWKS (RS256/RS384/RS512; the key set
+ *     is cached and refetched once when a token names an unknown kid, which
+ *     is how key rotation shows up)
+ *   - iss is the configured issuer (or one of acceptedIssuers)
+ *   - aud contains clientId, and azp is clientId when present or required
+ *   - exp/iat within clockSkewSeconds
+ *   - nonce equals the one minted for this login
+ *
+ * The signature is checked even though the token arrives straight from the
+ * token endpoint over TLS (where OIDC Core lets a client skip it): the check
+ * is cheap, and it keeps a misrouted or proxied token endpoint from being
+ * enough to forge a login.
+ *
+ * The identity id is the sub claim. When the ID token carries no email and
+ * the issuer has a userinfo endpoint, userinfo is read too (userinfo: "auto");
+ * its sub must match, and ID-token claims win over userinfo ones.
+ */
+class extends="OAuth2Provider" {
+
+	variables.DISCOVERY_PATH = "/.well-known/openid-configuration"
+
+	function init( struct options = {}, struct defaults = {} ) {
+		var oidcDefaults = {
+			name: "oidc",
+			scopes: [ "openid", "email", "profile" ],
+			discoverEndpoints: true
+		}
+		oidcDefaults.append( defaults, true )
+		var merged = structCopy( oidcDefaults )
+		merged.append( options, true )
+		var providerLabel = merged.name
+
+		variables.issuer = trim( merged.issuer ?: "" )
+		if ( !len( variables.issuer ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The #providerLabel# provider needs an issuer URL" )
+		}
+		if ( !isAllowedEndpoint( variables.issuer ) ) {
+			throw(
+				type = "BoxExpressAuth.InvalidProvider",
+				message = "The #providerLabel# provider's issuer must be https (plain http is only allowed for localhost)"
+			)
+		}
+		if ( !isArray( merged.scopes ) || !merged.scopes.findNoCase( "openid" ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The #providerLabel# provider's scopes must include openid" )
+		}
+
+		variables.acceptedIssuers = merged.acceptedIssuers ?: [ variables.issuer ]
+		variables.clockSkewMs = ( merged.clockSkewSeconds ?: 60 ) * 1000
+		// Floor between JWKS refetches triggered by an unknown kid, so a
+		// burst of logins during a key rotation fetches the key set once.
+		variables.jwksMinRefreshMs = ( merged.jwksMinRefreshSeconds ?: 60 ) * 1000
+		variables.userinfoMode = merged.userinfo ?: "auto"
+		if ( ![ "auto", "always", "never" ].findNoCase( variables.userinfoMode ) ) {
+			throw( type = "BoxExpressAuth.InvalidProvider", message = "The #providerLabel# provider's userinfo must be auto, always or never" )
+		}
+		variables.jwt = new "../Jwt"()
+		variables.algorithms = merged.algorithms ?: variables.jwt.supportedAlgorithms()
+		variables.lockName = "boxexpressauth-oidc-" & createUUID()
+		variables.discovery = {}
+		variables.keySet = { keys: [], fetchedAt: 0 }
+
+		// Endpoints given outright skip discovery entirely (an issuer
+		// without a discovery document, or a test).
+		if ( len( merged.authorizeUrl ?: "" ) && len( merged.tokenUrl ?: "" ) && len( merged.jwksUri ?: "" ) ) {
+			variables.discovery = {
+				authorizeUrl: merged.authorizeUrl,
+				tokenUrl: merged.tokenUrl,
+				jwksUri: merged.jwksUri,
+				userinfoUrl: merged.userinfoUrl ?: ""
+			}
+		}
+
+		return super.init( options, oidcDefaults )
+	}
+
+	function authorizationParams( string nonce = "" ) {
+		return len( nonce ) ? [ [ "nonce", nonce ] ] : []
+	}
+
+	function getAuthorizeUrl() {
+		return discover().authorizeUrl
+	}
+
+	function getTokenUrl() {
+		return discover().tokenUrl
+	}
+
+	function getIssuer() {
+		return variables.issuer
+	}
+
+	/**
+	 * The issuer's endpoints, fetched once and cached. A failure isn't
+	 * cached, so the next login tries again.
+	 */
+	function discover() {
+		if ( structCount( variables.discovery ) ) {
+			return variables.discovery
+		}
+		lock name=variables.lockName type="exclusive" timeout=15 {
+			if ( !structCount( variables.discovery ) ) {
+				var discoveryUrl = reReplace( variables.issuer, "/+$", "" ) & variables.DISCOVERY_PATH
+				var response = variables.httpClient.request( {
+					method: "GET",
+					url: discoveryUrl,
+					headers: { "Accept": "application/json", "User-Agent": variables.userAgent }
+				} )
+				if ( response.status < 200 || response.status >= 300 ) {
+					throw( type = "BoxExpressAuth.DiscoveryFailed", message = "#this.name# discovery document answered HTTP #response.status#" )
+				}
+				var doc = parseJSON( response.body )
+				if ( !isStruct( doc ) ) {
+					throw( type = "BoxExpressAuth.DiscoveryFailed", message = "#this.name# discovery document isn't a JSON object" )
+				}
+				// OIDC Discovery 4.3: the document's issuer must be exactly the
+				// one we asked — otherwise it could hand us someone else's keys.
+				if ( compare( doc.issuer ?: "", variables.issuer ) != 0 ) {
+					throw( type = "BoxExpressAuth.DiscoveryFailed", message = "#this.name# discovery document is for a different issuer" )
+				}
+				for ( var field in [ "authorization_endpoint", "token_endpoint", "jwks_uri" ] ) {
+					if ( !isSimpleValue( doc[ field ] ?: "" ) || !isAllowedEndpoint( doc[ field ] ?: "" ) ) {
+						throw( type = "BoxExpressAuth.DiscoveryFailed", message = "#this.name# discovery document has no usable #field#" )
+					}
+				}
+				var userinfoUrl = isSimpleValue( doc.userinfo_endpoint ?: "" ) && isAllowedEndpoint( doc.userinfo_endpoint ?: "" ) ? doc.userinfo_endpoint : ""
+				variables.discovery = {
+					authorizeUrl: doc.authorization_endpoint,
+					tokenUrl: doc.token_endpoint,
+					jwksUri: doc.jwks_uri,
+					userinfoUrl: userinfoUrl
+				}
+			}
+		}
+		return variables.discovery
+	}
+
+	function fetchProfile( required struct tokens, struct context = {} ) {
+		var idToken = tokens.idToken ?: ""
+		if ( !isSimpleValue( idToken ) || !len( idToken ) ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "#this.name# token response had no id_token" )
+		}
+		var claims = validateIdToken( idToken, context.nonce ?: "" )
+
+		var userinfoUrl = discover().userinfoUrl
+		var wantUserinfo = compare( variables.userinfoMode, "always" ) == 0
+			|| ( compare( variables.userinfoMode, "auto" ) == 0 && !len( _string( claims.email ?: "" ) ) )
+		if ( wantUserinfo && len( userinfoUrl ) ) {
+			var info = getJSON( userinfoUrl, tokens )
+			// OIDC Core 5.3.2: userinfo for a different sub must be discarded.
+			if ( !isStruct( info ) || compare( _string( info.sub ?: "" ), claims.sub ) != 0 ) {
+				throw( type = "BoxExpressAuth.ProfileFailed", message = "#this.name# userinfo is for a different subject" )
+			}
+			var combined = structCopy( info )
+			combined.append( claims, true )
+			claims = combined
+		}
+		return identityFromClaims( claims )
+	}
+
+	/**
+	 * The checked claims, or a BoxExpressAuth.ProfileFailed throw naming
+	 * which check failed (never the token itself).
+	 */
+	function validateIdToken( required string idToken, required string nonce ) {
+		if ( len( idToken ) > 16384 ) {
+			_reject( "is too large" )
+		}
+		var decoded = {}
+		try {
+			decoded = variables.jwt.decode( idToken )
+		} catch ( "BoxExpressAuth.InvalidToken" e ) {
+			_reject( "is malformed" )
+		}
+
+		var alg = _string( decoded.header.alg ?: "" )
+		if ( !variables.algorithms.find( alg ) ) {
+			_reject( "uses an algorithm that isn't allowed (#_safeCode( alg )#)" )
+		}
+		if ( structKeyExists( decoded.header, "crit" ) ) {
+			_reject( "has critical header extensions" )
+		}
+		if ( !verifySignature( decoded, alg, _string( decoded.header.kid ?: "" ) ) ) {
+			_reject( "signature doesn't verify against the issuer's keys" )
+		}
+
+		var claims = decoded.payload
+		var tokenIssuer = _string( claims.iss ?: "" )
+		var issuerOk = false
+		for ( var accepted in variables.acceptedIssuers ) {
+			if ( compare( tokenIssuer, accepted ) == 0 ) {
+				issuerOk = true
+			}
+		}
+		if ( !issuerOk ) {
+			_reject( "is from a different issuer" )
+		}
+
+		var audiences = isArray( claims.aud ?: "" ) ? claims.aud : [ _string( claims.aud ?: "" ) ]
+		var audienceOk = false
+		for ( var audience in audiences ) {
+			if ( isSimpleValue( audience ) && compare( audience, variables.clientId ) == 0 ) {
+				audienceOk = true
+			}
+		}
+		if ( !audienceOk ) {
+			_reject( "is for a different client" )
+		}
+		var authorizedParty = _string( claims.azp ?: "" )
+		if ( ( arrayLen( audiences ) > 1 || len( authorizedParty ) ) && compare( authorizedParty, variables.clientId ) != 0 ) {
+			_reject( "has an azp that isn't this client" )
+		}
+
+		var now = variables.crypto.nowMs()
+		if ( !isNumeric( claims.exp ?: "" ) || claims.exp * 1000 + variables.clockSkewMs < now ) {
+			_reject( "has expired" )
+		}
+		if ( !isNumeric( claims.iat ?: "" ) || claims.iat * 1000 - variables.clockSkewMs > now ) {
+			_reject( "has a missing or future iat" )
+		}
+
+		var tokenNonce = _string( claims.nonce ?: "" )
+		if ( !len( nonce ) || !len( tokenNonce ) || !variables.crypto.constantTimeEquals( tokenNonce, nonce ) ) {
+			_reject( "nonce doesn't match this login" )
+		}
+
+		claims.sub = _string( claims.sub ?: "" )
+		if ( !len( claims.sub ) ) {
+			_reject( "has no sub" )
+		}
+		return claims
+	}
+
+	function verifySignature( required struct decoded, required string alg, required string kid ) {
+		for ( var attempt = 1; attempt <= 2; attempt++ ) {
+			var candidates = signingKeys( kid, alg, attempt == 2 )
+			for ( var jwk in candidates ) {
+				if ( variables.jwt.verifyRsa( decoded, jwk, alg ) ) {
+					return true
+				}
+			}
+			// A kid we have never seen is how a key rotation looks from here:
+			// refetch once. A known kid that fails is just a bad signature.
+			if ( arrayLen( candidates ) || !len( kid ) ) {
+				return false
+			}
+		}
+		return false
+	}
+
+	function signingKeys( required string kid, required string alg, boolean refresh = false ) {
+		var wantKid = kid
+		var wantAlg = alg
+		var keys = jwks( refresh )
+		return keys.filter( ( jwk ) => isStruct( jwk )
+			&& compare( jwk.kty ?: "", "RSA" ) == 0
+			&& ( !structKeyExists( jwk, "use" ) || compare( jwk.use, "sig" ) == 0 )
+			&& ( !structKeyExists( jwk, "alg" ) || compare( jwk.alg, wantAlg ) == 0 )
+			&& ( !len( wantKid ) || compare( jwk.kid ?: "", wantKid ) == 0 ) )
+	}
+
+	function jwks( boolean refresh = false ) {
+		var now = variables.crypto.nowMs()
+		var cached = variables.keySet
+		var stale = !arrayLen( cached.keys ) || ( refresh && now - cached.fetchedAt >= variables.jwksMinRefreshMs )
+		if ( !stale ) {
+			return cached.keys
+		}
+		lock name=variables.lockName type="exclusive" timeout=15 {
+			if ( variables.keySet.fetchedAt == cached.fetchedAt ) {
+				var response = variables.httpClient.request( {
+					method: "GET",
+					url: discover().jwksUri,
+					headers: { "Accept": "application/json", "User-Agent": variables.userAgent }
+				} )
+				if ( response.status < 200 || response.status >= 300 ) {
+					throw( type = "BoxExpressAuth.ProfileFailed", message = "#this.name# JWKS answered HTTP #response.status#" )
+				}
+				var doc = parseJSON( response.body )
+				if ( !isStruct( doc ) || !isArray( doc.keys ?: "" ) ) {
+					throw( type = "BoxExpressAuth.ProfileFailed", message = "#this.name# JWKS has no keys array" )
+				}
+				variables.keySet = { keys: doc.keys, fetchedAt: now }
+			}
+		}
+		return variables.keySet.keys
+	}
+
+	function identityFromClaims( required struct claims ) {
+		var email = _string( claims.email ?: "" )
+		var displayName = _string( claims.name ?: "" )
+		if ( !len( displayName ) ) {
+			displayName = trim( _string( claims.given_name ?: "" ) & " " & _string( claims.family_name ?: "" ) )
+		}
+		return {
+			provider: this.name,
+			id: claims.sub,
+			email: email,
+			emailVerified: len( email ) > 0 && _isTrue( claims.email_verified ?: false ),
+			name: displayName,
+			username: _string( claims.preferred_username ?: "" ),
+			avatarUrl: _string( claims.picture ?: "" ),
+			raw: claims
+		}
+	}
+
+	/**
+	 * https anywhere; plain http only on loopback, for a local Keycloak or
+	 * Authelia during development.
+	 */
+	function isAllowedEndpoint( required string candidate ) {
+		return reFindNoCase( "^https://[^/?##]+", candidate ) > 0
+			|| reFindNoCase( "^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?(/|$)", candidate ) > 0
+	}
+
+	/**
+	 * Some issuers send email_verified as the string "true". Compared
+	 * exactly, since BoxLang's == would also take "yes".
+	 */
+	function _isTrue( value ) {
+		return isSimpleValue( value ) && compare( lCase( toString( value ) ), "true" ) == 0
+	}
+
+	function _string( value ) {
+		return isSimpleValue( value ) ? toString( value ) : ""
+	}
+
+	function _reject( required string reason ) {
+		throw( type = "BoxExpressAuth.ProfileFailed", message = "#this.name# ID token #reason#" )
+	}
+
+}

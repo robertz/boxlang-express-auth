@@ -132,21 +132,34 @@ class {
 	}
 
 	function handleStart( req, res ) {
-		var selected = getProvider( req.params.provider )
-		if ( isSimpleValue( selected ) ) {
+		// The registered name, not the provider's own name, keys the session
+		// and the identity: two generic OIDC providers can share a class.
+		var providerName = registeredName( req.params.provider )
+		if ( !len( providerName ) ) {
 			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
 		}
+		var selected = variables.providers[ providerName ]
 		assertSession( req )
 
 		var state = variables.crypto.randomToken( 32 )
 		var codeVerifier = variables.crypto.randomToken( 32 )
 		var nonce = variables.crypto.randomToken( 16 )
 
+		// Built before anything is stored: an OIDC provider may have to fetch
+		// its discovery document here, and if that fails the user should land
+		// on failureRedirect, not a 500 with a half-started login.
+		var authorizeTarget = ""
+		try {
+			authorizeTarget = selected.authorizationUrl( state, codeVerifier, nonce, selected.callbackUrl )
+		} catch ( any e ) {
+			return fail( res, providerName, "provider_error", e )
+		}
+
 		var bucket = sessionBucket( req, true )
 		if ( !isStruct( bucket.pending ?: "" ) ) {
 			bucket.pending = {}
 		}
-		bucket.pending[ selected.name ] = {
+		bucket.pending[ providerName ] = {
 			state: state,
 			codeVerifier: codeVerifier,
 			nonce: nonce,
@@ -155,14 +168,17 @@ class {
 		}
 
 		res.set( "Cache-Control", "no-store" )
-		return res.redirect( selected.authorizationUrl( state, codeVerifier, nonce, selected.callbackUrl ) )
+		return res.redirect( authorizeTarget )
 	}
 
 	function handleCallback( req, res ) {
-		var selected = getProvider( req.params.provider )
-		if ( isSimpleValue( selected ) ) {
+		// The registered name, not the provider's own name, keys the session
+		// and the identity: two generic OIDC providers can share a class.
+		var providerName = registeredName( req.params.provider )
+		if ( !len( providerName ) ) {
 			return res.status( 404 ).json( { error: true, code: "unknown_provider", message: "Unknown login provider" } )
 		}
+		var selected = variables.providers[ providerName ]
 		assertSession( req )
 		res.set( "Cache-Control", "no-store" )
 
@@ -170,44 +186,44 @@ class {
 		// callback succeeds, fails, or throws.
 		var bucket = sessionBucket( req, false )
 		var pendingAll = isStruct( bucket.pending ?: "" ) ? bucket.pending : {}
-		var pending = pendingAll[ selected.name ] ?: ""
-		structDelete( pendingAll, selected.name )
+		var pending = pendingAll[ providerName ] ?: ""
+		structDelete( pendingAll, providerName )
 
 		var providerError = req.query.error ?: ""
 		if ( !isSimpleValue( providerError ) || len( providerError ) ) {
-			return fail( res, selected.name, compare( providerError, "access_denied" ) == 0 ? "access_denied" : "provider_error" )
+			return fail( res, providerName, compare( providerError, "access_denied" ) == 0 ? "access_denied" : "provider_error" )
 		}
 
 		var returnedState = req.query.state ?: ""
 		if ( !isStruct( pending ) || !isSimpleValue( returnedState ) || !len( returnedState ) || !variables.crypto.constantTimeEquals( returnedState, pending.state ) ) {
-			return fail( res, selected.name, "invalid_state" )
+			return fail( res, providerName, "invalid_state" )
 		}
 		if ( variables.crypto.nowMs() - pending.createdAt > variables.stateTtlMs ) {
-			return fail( res, selected.name, "expired_state" )
+			return fail( res, providerName, "expired_state" )
 		}
 
 		var code = req.query.code ?: ""
 		if ( !isSimpleValue( code ) || !len( code ) ) {
-			return fail( res, selected.name, "provider_error" )
+			return fail( res, providerName, "provider_error" )
 		}
 
 		var tokens = {}
 		try {
 			tokens = selected.exchangeCode( code, pending.codeVerifier, selected.callbackUrl )
 		} catch ( any e ) {
-			return fail( res, selected.name, "token_exchange_failed", e )
+			return fail( res, providerName, "token_exchange_failed", e )
 		}
 
 		var identity = {}
 		try {
 			identity = selected.fetchProfile( tokens, { nonce: pending.nonce } )
 		} catch ( any e ) {
-			return fail( res, selected.name, "profile_failed", e )
+			return fail( res, providerName, "profile_failed", e )
 		}
 		if ( !isStruct( identity ) || !isSimpleValue( identity.id ?: "" ) || !len( identity.id ?: "" ) ) {
-			return fail( res, selected.name, "profile_failed" )
+			return fail( res, providerName, "profile_failed" )
 		}
-		identity.provider = selected.name
+		identity.provider = providerName
 		identity.id = toString( identity.id )
 
 		// verify() and loadUser() are app code: if they throw, that's an app
@@ -215,7 +231,7 @@ class {
 		// handler as a 500 rather than being dressed up as a failed login.
 		var verified = { user: variables.verifyFn( identity, tokens, req ) }
 		if ( isNull( verified.user ) || !isStruct( verified.user ) || !isSimpleValue( verified.user.id ?: "" ) || !len( verified.user.id ?: "" ) ) {
-			return fail( res, selected.name, "login_denied" )
+			return fail( res, providerName, "login_denied" )
 		}
 
 		// New id before the session becomes authenticated, so an id planted
@@ -338,12 +354,21 @@ class {
 	}
 
 	function getProvider( name ) {
+		var registered = registeredName( name )
+		return len( registered ) ? variables.providers[ registered ] : ""
+	}
+
+	/**
+	 * Exact, case-sensitive match against the registered names ("" when
+	 * none) — BoxLang's own struct lookups would also take "GitHub".
+	 */
+	function registeredName( name ) {
 		if ( !isSimpleValue( name ) ) {
 			return ""
 		}
 		for ( var registered in variables.providers ) {
 			if ( compare( registered, name ) == 0 ) {
-				return variables.providers[ registered ]
+				return registered
 			}
 		}
 		return ""

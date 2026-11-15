@@ -1,0 +1,44 @@
+/**
+ * Google sign-in: OIDCProvider pointed at accounts.google.com.
+ *
+ * Google's ID tokens carry iss as either "https://accounts.google.com" or
+ * "accounts.google.com", so both are accepted. Google has no
+ * preferred_username, so identity.username is "".
+ *
+ * hostedDomain restricts sign-in to a Google Workspace domain. It is sent
+ * as the hd parameter (which only pre-selects the account — a user can
+ * remove it) and then *enforced* against the signed hd claim, which is the
+ * part that actually keeps other accounts out. "*" accepts any Workspace
+ * domain but no consumer @gmail.com accounts.
+ */
+class extends="OIDCProvider" {
+
+	function init( struct options = {} ) {
+		variables.hostedDomain = trim( options.hostedDomain ?: "" )
+		var googleOptions = structCopy( options )
+		if ( len( variables.hostedDomain ) ) {
+			var extraParams = isStruct( options.authorizeParams ?: "" ) ? structCopy( options.authorizeParams ) : {}
+			extraParams.hd = variables.hostedDomain
+			googleOptions.authorizeParams = extraParams
+		}
+		return super.init( googleOptions, {
+			name: "google",
+			issuer: "https://accounts.google.com",
+			acceptedIssuers: [ "https://accounts.google.com", "accounts.google.com" ]
+		} )
+	}
+
+	function identityFromClaims( required struct claims ) {
+		if ( len( variables.hostedDomain ) ) {
+			var tokenDomain = _string( claims.hd ?: "" )
+			var allowed = compare( variables.hostedDomain, "*" ) == 0
+				? len( tokenDomain ) > 0
+				: compareNoCase( tokenDomain, variables.hostedDomain ) == 0
+			if ( !allowed ) {
+				throw( type = "BoxExpressAuth.ProfileFailed", message = "google account isn't in the required hosted domain" )
+			}
+		}
+		return super.identityFromClaims( claims )
+	}
+
+}

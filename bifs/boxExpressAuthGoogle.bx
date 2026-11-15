@@ -1,0 +1,17 @@
+/**
+ * Global BIF wrapping the Google provider.
+ *
+ *   auth.provider( "google", boxExpressAuthGoogle( {
+ *     clientId: getSystemSetting( "GOOGLE_CLIENT_ID" ),
+ *     clientSecret: getSystemSetting( "GOOGLE_CLIENT_SECRET" ),
+ *     callbackUrl: "https://tracker.example.com/auth/google/callback"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.Google( options )
+	}
+
+}

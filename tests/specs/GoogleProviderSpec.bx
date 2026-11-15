@@ -1,0 +1,86 @@
+/**
+ * The Google preset: Google's endpoints, both of its issuer spellings, and
+ * hosted-domain enforcement.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	function run() {
+
+		describe( "Google", function() {
+
+			it( "sends the user to Google's authorize endpoint with openid email profile", function() {
+				var app = buildOidcApp( "google" )
+				var location = app.inject( "/auth/google" ).header( "Location" )
+				expect( location ).toInclude( "https://accounts.google.com/o/oauth2/v2/auth?" )
+				expect( queryParam( location, "scope" ) ).toBe( "openid email profile" )
+				expect( queryParam( location, "code_challenge_method" ) ).toBe( "S256" )
+				expect( location ).notToInclude( "hd=" )
+			} )
+
+			it( "logs in with Google's sub, email and picture", function() {
+				var app = buildOidcApp( "google" )
+				expectOidcSuccess( oidcLogin( app, { sub: "110169484474386276334", preferred_username: "__remove__" } ) )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.provider ).toBe( "google" )
+				expect( identity.id ).toBe( "110169484474386276334" )
+				expect( identity.email ).toBe( "ada@example.com" )
+				expect( identity.emailVerified ).toBeTrue()
+				expect( identity.username ).toBe( "" )
+				expect( identity.avatarUrl ).toBe( "https://example.com/ada.png" )
+			} )
+
+			it( "accepts the bare accounts.google.com issuer as well", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "google" ), { iss: "accounts.google.com" } ) )
+			} )
+
+			it( "still rejects other issuers", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "google" ), { iss: "https://accounts.google.com.attacker.test" } ), "profile_failed" )
+			} )
+
+			it( "needs clientId, clientSecret and callbackUrl", function() {
+				for ( var key in [ "clientId", "clientSecret", "callbackUrl" ] ) {
+					var options = { clientId: "c", clientSecret: "s", callbackUrl: variables.GOOGLE_CALLBACK }
+					structDelete( options, key )
+					expect( () => boxExpressAuthGoogle( options ) ).withContext( key ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				}
+			} )
+
+		} )
+
+		describe( "Google hostedDomain", function() {
+
+			it( "sends hd and accepts an account in that domain", function() {
+				var app = buildOidcApp( "google", { hostedDomain: "example.com" } )
+				var flow = oidcLogin( app, { hd: "example.com" } )
+				expect( queryParam( flow.location, "hd" ) ).toBe( "example.com" )
+				expectOidcSuccess( flow )
+			} )
+
+			it( "compares the domain case-insensitively", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "google", { hostedDomain: "Example.com" } ), { hd: "example.COM" } ) )
+			} )
+
+			it( "rejects an account from another domain, though the hd parameter was sent", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "google", { hostedDomain: "example.com" } ), { hd: "other.com" } ), "profile_failed" )
+			} )
+
+			it( "rejects a consumer account with no hd claim", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp( "google", { hostedDomain: "example.com" } ) ), "profile_failed" )
+			} )
+
+			it( "with * accepts any Workspace domain but no consumer account", function() {
+				expectOidcSuccess( oidcLogin( buildOidcApp( "google", { hostedDomain: "*" } ), { hd: "anything.org" } ) )
+				expectOidcFailure( oidcLogin( buildOidcApp( "google", { hostedDomain: "*" } ) ), "profile_failed" )
+			} )
+
+			it( "keeps the app's own authorizeParams alongside hd", function() {
+				var location = buildOidcApp( "google", { hostedDomain: "example.com", authorizeParams: { prompt: "select_account" } } ).inject( "/auth/google" ).header( "Location" )
+				expect( queryParam( location, "hd" ) ).toBe( "example.com" )
+				expect( queryParam( location, "prompt" ) ).toBe( "select_account" )
+			} )
+
+		} )
+
+	}
+
+}

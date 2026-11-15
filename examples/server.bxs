@@ -1,22 +1,17 @@
 /**
- * Runnable GitHub login demo.
+ * Runnable login demo for GitHub and/or Google — whichever has credentials.
  *
- *   export GITHUB_CLIENT_ID=...
- *   export GITHUB_CLIENT_SECRET=...
- *   export BASE_URL=http://localhost:3000      # optional; must match the OAuth app's callback
+ *   export GITHUB_CLIENT_ID=...  GITHUB_CLIENT_SECRET=...
+ *   export GOOGLE_CLIENT_ID=...  GOOGLE_CLIENT_SECRET=...
+ *   export BASE_URL=http://localhost:3000      # optional; must match the registered callbacks
  *   boxlang examples/server.bxs                 # from the repo root (needs boxlang_modules/)
  *
- * Register the OAuth app with callback URL  <BASE_URL>/auth/github/callback
+ * Callback URLs to register:  <BASE_URL>/auth/github/callback
+ *                             <BASE_URL>/auth/google/callback
  */
-clientId = getSystemSetting( "GITHUB_CLIENT_ID", "" )
-clientSecret = getSystemSetting( "GITHUB_CLIENT_SECRET", "" )
 baseUrl = getSystemSetting( "BASE_URL", "http://localhost:3000" )
 port = val( getSystemSetting( "PORT", "3000" ) )
-
-if ( !len( clientId ) || !len( clientSecret ) ) {
-	println( "Set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET first. Callback URL to register: #baseUrl#/auth/github/callback" )
-	createObject( "java", "java.lang.System" ).exit( 1 )
-}
+providerLabels = {}
 
 // Stands in for the app's users + user_identities tables (see README).
 users = createObject( "java", "java.util.concurrent.ConcurrentHashMap" ).init()
@@ -28,6 +23,7 @@ auth = boxExpressAuth( {
 		var userId = identity.provider & ":" & identity.id
 		users.put( userId, {
 			id: userId,
+			provider: identity.provider,
 			username: identity.username,
 			name: identity.name,
 			email: identity.email,
@@ -40,11 +36,27 @@ auth = boxExpressAuth( {
 	failureRedirect: "/",
 	loginPath: "/"
 } )
-auth.provider( "github", boxExpressAuthGitHub( {
-	clientId: clientId,
-	clientSecret: clientSecret,
-	callbackUrl: baseUrl & "/auth/github/callback"
-} ) )
+if ( len( getSystemSetting( "GITHUB_CLIENT_ID", "" ) ) ) {
+	auth.provider( "github", boxExpressAuthGitHub( {
+		clientId: getSystemSetting( "GITHUB_CLIENT_ID" ),
+		clientSecret: getSystemSetting( "GITHUB_CLIENT_SECRET", "" ),
+		callbackUrl: baseUrl & "/auth/github/callback"
+	} ) )
+	providerLabels.github = "GitHub"
+}
+if ( len( getSystemSetting( "GOOGLE_CLIENT_ID", "" ) ) ) {
+	auth.provider( "google", boxExpressAuthGoogle( {
+		clientId: getSystemSetting( "GOOGLE_CLIENT_ID" ),
+		clientSecret: getSystemSetting( "GOOGLE_CLIENT_SECRET", "" ),
+		callbackUrl: baseUrl & "/auth/google/callback"
+	} ) )
+	providerLabels.google = "Google"
+}
+if ( structIsEmpty( providerLabels ) ) {
+	println( "Set GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET and/or GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET first." )
+	println( "Callback URLs to register: #baseUrl#/auth/github/callback, #baseUrl#/auth/google/callback" )
+	createObject( "java", "java.lang.System" ).exit( 1 )
+}
 
 app = boxExpress()
 app.use( boxExpressSession( { resave: false, saveUninitialized: false } ) )
@@ -58,9 +70,11 @@ app.get( "/", auth.optional(), ( req, res ) => {
 		body &= "<p style='color:##b00'>Login failed: #escapeHtml( req.query.error )#</p>"
 	}
 	if ( isNull( req.user ) ) {
-		body &= "<p><a href='/auth/github?returnTo=%2Fprivate'>Sign in with GitHub</a></p>"
+		for ( var providerKey in providerLabels ) {
+			body &= "<p><a href='/auth/#providerKey#?returnTo=%2Fprivate'>Sign in with #providerLabels[ providerKey ]#</a></p>"
+		}
 	} else {
-		body &= "<p>Signed in as <strong>#escapeHtml( req.user.username )#</strong> (#escapeHtml( req.user.email )#"
+		body &= "<p>Signed in as <strong>#escapeHtml( len( req.user.username ) ? req.user.username : req.user.name )#</strong> via #escapeHtml( req.user.provider )# (#escapeHtml( req.user.email )#"
 			& ( req.user.emailVerified ? ", verified" : ", unverified" ) & ")</p>"
 			& "<form method='post' action='/auth/logout'><input type='hidden' name='_csrf' value='#escapeHtml( req.csrfToken() )#'><button>Sign out</button></form>"
 	}

@@ -1,5 +1,47 @@
 # Changelog
 
+**0.2.0**
+- **Google sign-in** (`models/providers/Google.bx`, `boxExpressAuthGoogle()`),
+  built as a preset of a new **generic OpenID Connect provider**
+  (`models/providers/OIDCProvider.bx`, `boxExpressAuthOIDC()`) rather than a
+  Google-only class: Google needs nearly everything OIDC does (discovery, a
+  nonce, ID-token validation), and the tracker's self-hosted Keycloak and
+  Authelia need exactly the same code.
+  - The ID token's signature is checked against the issuer's JWKS even
+    though it arrives straight from the token endpoint, where OIDC Core and
+    Google's docs both allow skipping it. It's cheap, and it means a
+    misrouted or intercepted token endpoint can't mint a login.
+  - `iss`, `aud`/`azp`, `exp`/`iat` and the `nonce` are all checked; `none`
+    and HMAC algorithms and RSA keys under 2048 bits are refused. The
+    discovery document must name the configured issuer, or it could point
+    validation at someone else's keys. Plain http is allowed only for
+    loopback issuers, for local Keycloak/Authelia.
+  - The JWKS is cached and refetched once for an unknown `kid` (how a key
+    rotation shows up), throttled by `jwksMinRefreshSeconds`.
+  - Userinfo is read only when the ID token has no email (Authelia's
+    default), must describe the same `sub`, and can't override signed
+    claims.
+  - Google's `hostedDomain` is enforced against the signed `hd` claim, not
+    just sent as the `hd` parameter: Google documents the parameter as a
+    UI hint a user can strip.
+  - Only RS256/RS384/RS512 ID tokens for now (`models/Jwt.bx`), which
+    covers Google, Keycloak and Authelia defaults.
+- **Pending logins and identities are keyed by the name a provider is
+  registered under** (`models/Auth.bx`), not the provider's own `name`. Two
+  generic OIDC providers share a class; keyed by `name`, they'd have
+  overwritten each other's pending state.
+- **`GET /auth/:provider` builds the authorize URL before storing anything,
+  and a failure there is a `provider_error` redirect** instead of a 500 —
+  an OIDC provider may fetch its discovery document at that point, and an
+  IdP outage shouldn't look like a crash.
+- **`authorizeParams`** on every provider passes extra authorize-URL
+  parameters (`prompt`, `login_hint`, …). The parameters the flow's security
+  rests on (`state`, `nonce`, PKCE, `redirect_uri`, `scope`) are refused, so
+  configuration can't quietly weaken it.
+- **`exchangeCode()` also returns `idToken`** when the provider sends one,
+  so `verify()` can keep it (for RP-initiated logout) — it's still never
+  stored by this module.
+
 **0.1.0**
 - First release: third-party login for BoxExpress apps, built for a
   developer-facing issue tracker that needs "Sign in with GitHub" now and

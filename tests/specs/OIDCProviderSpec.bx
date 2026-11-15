@@ -1,0 +1,359 @@
+/**
+ * The generic OIDC provider end to end through Auth: discovery, the nonce,
+ * and every ID-token check, against tokens signed by TestIssuer.
+ */
+class extends="tests.helpers.OidcTestSupport" {
+
+	function run() {
+
+		describe( "OIDC: starting a login", function() {
+
+			it( "discovers the authorize endpoint and sends nonce, PKCE S256 and the openid scopes", function() {
+				var app = buildOidcApp()
+				var started = app.inject( "/auth/idp" )
+				var location = started.header( "Location" )
+				assertAll( [
+					() => expect( started.statusCode ).toBe( 302 ),
+					() => expect( location ).toInclude( variables.endpoints.authorize & "?" ),
+					() => expect( queryParam( location, "client_id" ) ).toBe( variables.CLIENT_ID ),
+					() => expect( queryParam( location, "scope" ) ).toBe( "openid email profile" ),
+					() => expect( queryParam( location, "code_challenge_method" ) ).toBe( "S256" ),
+					() => expect( len( queryParam( location, "nonce" ) ) ).toBeGT( 15 ),
+					() => expect( queryParam( location, "nonce" ) ).toBe( sessionOf( app, started.cookies ).auth.pending.idp.nonce )
+				] )
+			} )
+
+			it( "fetches the discovery document once, not per login", function() {
+				var app = buildOidcApp()
+				oidcLogin( app )
+				oidcLogin( app )
+				expect( variables.fake.callsTo( "GET #variables.endpoints.discovery#" ) ).toHaveLength( 1 )
+				expect( variables.fake.callsTo( "GET #variables.endpoints.jwks#" ) ).toHaveLength( 1 )
+			} )
+
+			it( "sends failureRedirect provider_error, not a 500, when discovery fails — and stores nothing", function() {
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/.well-known/openid-configuration": { status: 503, body: "down" } } )
+				var started = app.inject( "/auth/idp" )
+				expect( started.statusCode ).toBe( 302 )
+				expect( started.header( "Location" ) ).toBe( "/login?error=provider_error" )
+				expect( sessionOf( app, started.cookies ) ).notToHaveKey( "auth" )
+			} )
+
+			it( "refuses a discovery document that names a different issuer", function() {
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/.well-known/openid-configuration": { body: {
+					issuer: "https://attacker.test",
+					authorization_endpoint: "https://attacker.test/auth",
+					token_endpoint: "https://attacker.test/token",
+					jwks_uri: "https://attacker.test/jwks"
+				} } } )
+				expect( app.inject( "/auth/idp" ).header( "Location" ) ).toBe( "/login?error=provider_error" )
+			} )
+
+			it( "refuses plain-http endpoints from discovery", function() {
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/.well-known/openid-configuration": { body: {
+					issuer: variables.IDP_ISSUER,
+					authorization_endpoint: "http://idp.test/auth",
+					token_endpoint: variables.IDP_ISSUER & "/token",
+					jwks_uri: variables.IDP_ISSUER & "/jwks"
+				} } } )
+				expect( app.inject( "/auth/idp" ).header( "Location" ) ).toBe( "/login?error=provider_error" )
+			} )
+
+			it( "skips discovery when the endpoints are given outright", function() {
+				var app = buildOidcApp( providerOptions = {
+					authorizeUrl: "https://idp.test/realms/tracker/protocol/openid-connect/auth",
+					tokenUrl: "https://idp.test/realms/tracker/protocol/openid-connect/token",
+					jwksUri: "https://idp.test/realms/tracker/protocol/openid-connect/certs"
+				} )
+				expectOidcSuccess( oidcLogin( app ) )
+				expect( variables.fake.callsTo( "GET #variables.endpoints.discovery#" ) ).toBeEmpty()
+			} )
+
+		} )
+
+		describe( "OIDC: a valid ID token", function() {
+
+			it( "logs in with sub as the id and the claims normalized", function() {
+				var app = buildOidcApp()
+				var flow = oidcLogin( app )
+				expectOidcSuccess( flow )
+				var identity = variables.verifyCalls[ 1 ].identity
+				assertAll( [
+					() => expect( identity.provider ).toBe( "idp" ),
+					() => expect( identity.id ).toBe( "user-123" ),
+					() => expect( identity.email ).toBe( "ada@example.com" ),
+					() => expect( identity.emailVerified ).toBeTrue(),
+					() => expect( identity.name ).toBe( "Ada Lovelace" ),
+					() => expect( identity.username ).toBe( "ada" ),
+					() => expect( identity.avatarUrl ).toBe( "https://example.com/ada.png" ),
+					() => expect( identity.raw.iss ).toBe( variables.IDP_ISSUER ),
+					() => expect( sessionOf( app, flow.finished.cookies ).auth.userId ).toBe( "42" )
+				] )
+			} )
+
+			it( "passes the id_token to verify() and keeps every token out of the session", function() {
+				var app = buildOidcApp()
+				var flow = oidcLogin( app )
+				var tokens = variables.verifyCalls[ 1 ].tokens
+				expect( tokens.accessToken ).toBe( "at-oidc-secret" )
+				expect( len( tokens.idToken ) ).toBeGT( 100 )
+				var stored = jsonSerialize( sessionOf( app, flow.finished.cookies ) )
+				expect( stored ).notToInclude( "at-oidc-secret" )
+				expect( stored ).notToInclude( tokens.idToken )
+			} )
+
+			it( "sends the PKCE verifier and client credentials to the discovered token endpoint", function() {
+				var app = buildOidcApp()
+				var flow = oidcLogin( app )
+				var exchange = variables.fake.callsTo( "POST #variables.endpoints.token#" )
+				expect( exchange ).toHaveLength( 1 )
+				expect( len( exchange[ 1 ].form.code_verifier ) ).toBe( 43 )
+				expect( exchange[ 1 ].form.client_id ).toBe( variables.CLIENT_ID )
+			} )
+
+			it( "accepts email_verified as the string true", function() {
+				var app = buildOidcApp()
+				oidcLogin( app, { email_verified: "true" } )
+				expect( variables.verifyCalls[ 1 ].identity.emailVerified ).toBeTrue()
+			} )
+
+			it( 'reports emailVerified false for false, a missing claim, or "yes"', function() {
+				for ( var value in [ false, "false", "yes", "__remove__" ] ) {
+					var app = buildOidcApp()
+					oidcLogin( app, { email_verified: value } )
+					expect( variables.verifyCalls[ 1 ].identity.emailVerified ).withContext( jsonSerialize( value ) ).toBeFalse()
+				}
+			} )
+
+			it( "builds a name from given_name and family_name when there's no name", function() {
+				var app = buildOidcApp()
+				oidcLogin( app, { name: "__remove__", given_name: "Grace", family_name: "Hopper" } )
+				expect( variables.verifyCalls[ 1 ].identity.name ).toBe( "Grace Hopper" )
+			} )
+
+			it( "accepts an aud array that includes this client when azp is this client", function() {
+				var app = buildOidcApp()
+				expectOidcSuccess( oidcLogin( app, { aud: [ variables.CLIENT_ID, "account" ], azp: variables.CLIENT_ID } ) )
+			} )
+
+			it( "accepts exp within the clock skew", function() {
+				var app = buildOidcApp()
+				expectOidcSuccess( oidcLogin( app, { exp: variables.idp.nowSeconds() - 30 } ) )
+			} )
+
+			it( "refetches the JWKS once for an unknown kid (key rotation)", function() {
+				var rotated = new tests.helpers.TestIssuer( "rotated-key" )
+				var app = buildOidcApp( providerOptions = { jwksMinRefreshSeconds: 0 } )
+				var served = { count: 0 }
+				var firstKeys = variables.idp.jwks()
+				var newKeys = rotated.jwks()
+				variables.fake.respond( "GET #variables.endpoints.jwks#", ( options ) => {
+					served.count++
+					return { body: served.count == 1 ? firstKeys : newKeys }
+				} )
+				expectOidcSuccess( oidcLogin( app, {}, ( claims ) => rotated.sign( claims ) ) )
+				expect( served.count ).toBe( 2 )
+			} )
+
+			it( "doesn't refetch the JWKS again within jwksMinRefreshSeconds", function() {
+				var rotated = new tests.helpers.TestIssuer( "rotated-key" )
+				var app = buildOidcApp()
+				oidcLogin( app )
+				variables.verifyCalls.clear()
+				var flow = oidcLogin( app, {}, ( claims ) => rotated.sign( claims ) )
+				expect( flow.finished.header( "Location" ) ).toBe( "/login?error=profile_failed" )
+				expect( variables.fake.callsTo( "GET #variables.endpoints.jwks#" ) ).toHaveLength( 1 )
+			} )
+
+		} )
+
+		describe( "OIDC: the login fails safely when the ID token", function() {
+
+			it( "is missing from the token response", function() {
+				var app = buildOidcApp()
+				var started = app.inject( "/auth/idp" )
+				variables.fake.respond( "POST #variables.endpoints.token#", { body: { access_token: "at", token_type: "Bearer" } } )
+				var finished = app.inject( { url: "/auth/idp/callback", query: { code: "c", state: queryParam( started.header( "Location" ), "state" ) }, cookies: started.cookies } )
+				expect( finished.header( "Location" ) ).toBe( "/login?error=profile_failed" )
+			} )
+
+			it( "is signed by a different key with the same kid", function() {
+				var app = buildOidcApp()
+				var impostor = variables.otherIdp
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => impostor.sign( claims ) ), "profile_failed" )
+			} )
+
+			it( "has a tampered payload", function() {
+				var app = buildOidcApp()
+				var issuer = variables.idp
+				var flow = oidcLogin( app, {}, ( claims ) => {
+					var good = listToArray( issuer.sign( claims ), "." )
+					var forged = duplicate( claims )
+					forged.sub = "admin"
+					var encoder = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
+					return good[ 1 ] & "." & encoder.encodeToString( charsetDecode( jsonSerialize( forged ), "UTF-8" ) ) & "." & good[ 3 ]
+				} )
+				expectOidcFailure( flow, "profile_failed" )
+			} )
+
+			it( "says alg none", function() {
+				var app = buildOidcApp()
+				var issuer = variables.idp
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => issuer.unsigned( claims ) ), "profile_failed" )
+			} )
+
+			it( "says HS256", function() {
+				var app = buildOidcApp()
+				var issuer = variables.idp
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => issuer.sign( claims, { alg: "HS256" } ) ), "profile_failed" )
+			} )
+
+			it( "names a kid the JWKS doesn't have, even after a refetch", function() {
+				var app = buildOidcApp()
+				var issuer = variables.idp
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => issuer.sign( claims, { kid: "nobody" } ) ), "profile_failed" )
+			} )
+
+			it( "is from another issuer", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { iss: "https://attacker.test" } ), "profile_failed" )
+			} )
+
+			it( "is for another client", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { aud: "someone-else" } ), "profile_failed" )
+			} )
+
+			it( "has several audiences and no azp", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { aud: [ variables.CLIENT_ID, "other" ] } ), "profile_failed" )
+			} )
+
+			it( "has an azp naming another client", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { azp: "other" } ), "profile_failed" )
+			} )
+
+			it( "has expired", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { exp: variables.idp.nowSeconds() - 600 } ), "profile_failed" )
+			} )
+
+			it( "has no exp", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { exp: "__remove__" } ), "profile_failed" )
+			} )
+
+			it( "was issued in the future", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { iat: variables.idp.nowSeconds() + 600 } ), "profile_failed" )
+			} )
+
+			it( "carries a different nonce", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { nonce: "replayed-from-another-login" } ), "profile_failed" )
+			} )
+
+			it( "carries no nonce", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { nonce: "__remove__" } ), "profile_failed" )
+			} )
+
+			it( "has no sub", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), { sub: "__remove__" } ), "profile_failed" )
+			} )
+
+			it( "is not a JWT at all", function() {
+				expectOidcFailure( oidcLogin( buildOidcApp(), {}, ( claims ) => "not.a-jwt" ), "profile_failed" )
+			} )
+
+			it( "is signed with a key under 2048 bits", function() {
+				var weak = new tests.helpers.TestIssuer( "weak", 1024 )
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/protocol/openid-connect/certs": { body: weak.jwks() } } )
+				expectOidcFailure( oidcLogin( app, {}, ( claims ) => weak.sign( claims ) ), "profile_failed" )
+			} )
+
+		} )
+
+		describe( "OIDC: userinfo", function() {
+
+			it( "is read when the ID token has no email, and fills it in", function() {
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/protocol/openid-connect/userinfo": { body: { sub: "user-123", email: "from-userinfo@example.com", email_verified: true } } } )
+				expectOidcSuccess( oidcLogin( app, { email: "__remove__", email_verified: "__remove__" } ) )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.email ).toBe( "from-userinfo@example.com" )
+				expect( identity.emailVerified ).toBeTrue()
+				expect( variables.fake.callsTo( "GET #variables.endpoints.userinfo#" )[ 1 ].headers.Authorization ).toBe( "Bearer at-oidc-secret" )
+			} )
+
+			it( "is not read when the ID token already has an email", function() {
+				var app = buildOidcApp()
+				oidcLogin( app )
+				expect( variables.fake.callsTo( "GET #variables.endpoints.userinfo#" ) ).toBeEmpty()
+			} )
+
+			it( "fails the login when it describes a different sub", function() {
+				var app = buildOidcApp( responses = { "GET #variables.IDP_ISSUER#/protocol/openid-connect/userinfo": { body: { sub: "someone-else", email: "x@example.com" } } } )
+				expectOidcFailure( oidcLogin( app, { email: "__remove__" } ), "profile_failed" )
+			} )
+
+			it( "can't override signed ID-token claims", function() {
+				var app = buildOidcApp(
+					providerOptions = { userinfo: "always" },
+					responses = { "GET #variables.IDP_ISSUER#/protocol/openid-connect/userinfo": { body: { sub: "user-123", email: "other@example.com", email_verified: true, nickname: "extra" } } }
+				)
+				oidcLogin( app, { email_verified: false } )
+				var identity = variables.verifyCalls[ 1 ].identity
+				expect( identity.email ).toBe( "ada@example.com" )
+				expect( identity.emailVerified ).toBeFalse()
+				expect( identity.raw.nickname ).toBe( "extra" )
+			} )
+
+		} )
+
+		describe( "OIDC: configuration", function() {
+
+			it( "needs an issuer", function() {
+				expect( () => boxExpressAuthOIDC( { clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+			it( "refuses a plain-http issuer that isn't localhost", function() {
+				expect( () => boxExpressAuthOIDC( { issuer: "http://sso.example.com/realms/x", clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+			it( "allows a plain-http issuer on localhost, for local Keycloak or Authelia", function() {
+				var provider = boxExpressAuthOIDC( { issuer: "http://localhost:8080/realms/dev", clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } )
+				expect( provider.getIssuer() ).toBe( "http://localhost:8080/realms/dev" )
+				expect( () => boxExpressAuthOIDC( { issuer: "http://localhost.attacker.test/x", clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+			it( "needs openid in the scopes", function() {
+				expect( () => boxExpressAuthOIDC( { issuer: variables.IDP_ISSUER, scopes: [ "email" ], clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } ) ).toThrow( "BoxExpressAuth.InvalidProvider" )
+			} )
+
+			it( "won't let authorizeParams override the flow's own parameters", function() {
+				for ( var reserved in [ "state", "nonce", "redirect_uri", "code_challenge_method", "Scope" ] ) {
+					var params = {}
+					params[ reserved ] = "x"
+					expect( () => boxExpressAuthOIDC( { issuer: variables.IDP_ISSUER, authorizeParams: params, clientId: "c", clientSecret: "s", callbackUrl: variables.IDP_CALLBACK } ) )
+						.withContext( reserved ).toThrow( "BoxExpressAuth.InvalidProvider" )
+				}
+			} )
+
+			it( "passes other authorizeParams through", function() {
+				var app = buildOidcApp( providerOptions = { authorizeParams: { prompt: "login" } } )
+				expect( queryParam( app.inject( "/auth/idp" ).header( "Location" ), "prompt" ) ).toBe( "login" )
+			} )
+
+			it( "keys the session by the registered name, so two providers of one class don't collide", function() {
+				var fake = new tests.helpers.FakeHttpClient()
+				var auth = boxExpressAuth( { verify: ( i, t, r ) => i } )
+				auth.provider( "keycloak", boxExpressAuthOIDC( { issuer: variables.IDP_ISSUER, authorizeUrl: "https://a.test/auth", tokenUrl: "https://a.test/token", jwksUri: "https://a.test/jwks", clientId: "c", clientSecret: "s", callbackUrl: "https://t.test/auth/keycloak/callback", httpClient: fake } ) )
+				auth.provider( "authelia", boxExpressAuthOIDC( { issuer: variables.IDP_ISSUER, authorizeUrl: "https://b.test/auth", tokenUrl: "https://b.test/token", jwksUri: "https://b.test/jwks", clientId: "c", clientSecret: "s", callbackUrl: "https://t.test/auth/authelia/callback", httpClient: fake } ) )
+				var app = boxExpress()
+				app.use( boxExpressSession() )
+				app.use( "/auth", auth.routes() )
+				app.get( "/test/session", ( req, res ) => res.json( { session: req.session } ) )
+				var first = app.inject( "/auth/keycloak" )
+				var second = app.inject( { url: "/auth/authelia", cookies: first.cookies } )
+				var pending = sessionOf( app, second.cookies ).auth.pending
+				expect( pending ).toHaveKey( "keycloak" )
+				expect( pending ).toHaveKey( "authelia" )
+			} )
+
+		} )
+
+	}
+
+}

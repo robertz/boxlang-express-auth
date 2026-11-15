@@ -8,7 +8,7 @@ you call `auth.provider( name, instance )`.
 | `name` | Short identifier; `identity.provider` is forced to the name it's registered under. |
 | `callbackUrl` | Absolute URL of `GET <mount>/<name>/callback`, exactly as registered with the provider. |
 | `authorizationUrl( state, codeVerifier, nonce, callbackUrl )` | The URL to send the browser to. |
-| `exchangeCode( code, codeVerifier, callbackUrl )` | Returns `{ accessToken, tokenType, scope }` (more keys are fine). |
+| `exchangeCode( code, codeVerifier, callbackUrl )` | Returns `{ accessToken, tokenType, scope }`, plus `idToken` when the provider sent one (more keys are fine). |
 | `fetchProfile( tokens, context )` | Returns the normalized identity (below). `context` is `{ nonce }`. |
 
 `exchangeCode()` and `fetchProfile()` signal failure by throwing — `Auth`
@@ -84,19 +84,48 @@ redirects followed, 15s timeout). Pass `httpClient` in the provider options
 to replace it — tests use `tests/helpers/FakeHttpClient.bx`; an app might
 add a proxy or tracing.
 
-## What OIDC will add
+## OIDC providers
 
-The next provider type is generic OpenID Connect (Google, Keycloak,
-Authelia). It fits this contract unchanged; the work is inside the provider:
+`models/providers/OIDCProvider.bx` is the generic OpenID Connect provider
+(see the README for its options). It extends `OAuth2Provider` with
+`discoverEndpoints: true` and overrides:
 
-- **Discovery.** Read `<issuer>/.well-known/openid-configuration` for the
-  authorization, token, userinfo and JWKS endpoints, instead of hard-coding
-  them. Cache it.
-- **`nonce`.** Override `authorizationParams( nonce )` to return
-  `[ [ "nonce", nonce ] ]`, and in `fetchProfile( tokens, context )` check
-  the ID token's `nonce` claim equals `context.nonce`.
-- **`id_token`.** Return it from `exchangeCode()` and validate it in
-  `fetchProfile()`: signature against the JWKS (with key rotation), `iss`,
-  `aud` = client id, `exp`/`iat`, and `nonce`. The identity's `id` is the
-  `sub` claim; `emailVerified` is the `email_verified` claim.
-- `scope` must include `openid`.
+- `getAuthorizeUrl()` / `getTokenUrl()` — read from the cached discovery
+  document instead of fixed options.
+- `authorizationParams( nonce )` — adds `nonce`.
+- `fetchProfile( tokens, context )` — validates `tokens.idToken` (signature
+  against the JWKS, `iss`, `aud`/`azp`, `exp`/`iat`, `nonce` =
+  `context.nonce`), optionally merges userinfo, then calls
+  `identityFromClaims( claims )`.
+
+A preset for a specific issuer is a subclass that passes defaults and, if
+needed, overrides `identityFromClaims()` to enforce something extra — see
+`Google.bx`, which pins the issuer, accepts Google's two `iss` spellings, and
+enforces `hostedDomain` against the `hd` claim:
+
+```js
+class extends="bxModules.boxexpressauth.models.providers.OIDCProvider" {
+
+	function init( struct options = {} ) {
+		return super.init( options, {
+			name: "acme",
+			issuer: "https://login.acme.test",
+			scopes: [ "openid", "email" ]
+		} )
+	}
+
+	function identityFromClaims( required struct claims ) {
+		if ( !( claims.acme_employee ?: false ) ) {
+			throw( type = "BoxExpressAuth.ProfileFailed", message = "acme account isn't an employee" )
+		}
+		return super.identityFromClaims( claims )
+	}
+
+}
+```
+
+ID tokens are verified by `models/Jwt.bx`: RS256/RS384/RS512 only, keys of
+2048 bits or more. Adding ES256 (some IdPs default to it) means teaching
+`Jwt.bx` to build an EC key from a JWK's `crv`/`x`/`y` and to convert the
+JWS signature from its raw `r||s` form to the DER form Java's `Signature`
+expects.

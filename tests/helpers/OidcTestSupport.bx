@@ -1,0 +1,160 @@
+/**
+ * Apps wired to an OIDC provider (generic "idp", or Google) on a
+ * FakeHttpClient that serves discovery, JWKS, and a token endpoint whose
+ * ID token each spec mints for the login in progress.
+ */
+class extends="tests.helpers.AuthTestSupport" {
+
+	variables.IDP_ISSUER = "https://idp.test/realms/tracker"
+	variables.IDP_CALLBACK = "https://tracker.test/auth/idp/callback"
+	variables.GOOGLE_ISSUER = "https://accounts.google.com"
+	variables.GOOGLE_CALLBACK = "https://tracker.test/auth/google/callback"
+	variables.CLIENT_ID = "tracker-client"
+
+	function beforeAll() {
+		variables.idp = new tests.helpers.TestIssuer( "test-key-1" )
+		variables.otherIdp = new tests.helpers.TestIssuer( "test-key-1" )
+	}
+
+	function endpointsFor( required string kind ) {
+		if ( compare( kind, "google" ) == 0 ) {
+			return {
+				issuer: variables.GOOGLE_ISSUER,
+				discovery: "https://accounts.google.com/.well-known/openid-configuration",
+				authorize: "https://accounts.google.com/o/oauth2/v2/auth",
+				token: "https://oauth2.googleapis.com/token",
+				jwks: "https://www.googleapis.com/oauth2/v3/certs",
+				userinfo: "https://openidconnect.googleapis.com/v1/userinfo",
+				callback: variables.GOOGLE_CALLBACK,
+				name: "google"
+			}
+		}
+		return {
+			issuer: variables.IDP_ISSUER,
+			discovery: variables.IDP_ISSUER & "/.well-known/openid-configuration",
+			authorize: variables.IDP_ISSUER & "/protocol/openid-connect/auth",
+			token: variables.IDP_ISSUER & "/protocol/openid-connect/token",
+			jwks: variables.IDP_ISSUER & "/protocol/openid-connect/certs",
+			userinfo: variables.IDP_ISSUER & "/protocol/openid-connect/userinfo",
+			callback: variables.IDP_CALLBACK,
+			name: "idp"
+		}
+	}
+
+	function discoveryResponses( required struct endpoints ) {
+		return {
+			"GET #endpoints.discovery#": { body: {
+				issuer: endpoints.issuer,
+				authorization_endpoint: endpoints.authorize,
+				token_endpoint: endpoints.token,
+				jwks_uri: endpoints.jwks,
+				userinfo_endpoint: endpoints.userinfo,
+				code_challenge_methods_supported: [ "S256" ]
+			} },
+			"GET #endpoints.jwks#": { body: variables.idp.jwks() }
+		}
+	}
+
+	/**
+	 * @kind            "idp" (generic OIDC) or "google"
+	 * @providerOptions merged over clientId/clientSecret/callbackUrl (and issuer for idp)
+	 * @responses       replaces scripted responses by key
+	 */
+	function buildOidcApp( string kind = "idp", struct providerOptions = {}, struct responses = {}, struct authOptions = {} ) {
+		variables.endpoints = endpointsFor( kind )
+		var scripted = discoveryResponses( variables.endpoints )
+		scripted.append( responses, true )
+		variables.fake = new tests.helpers.FakeHttpClient( scripted )
+		variables.verifyCalls = []
+
+		var seen = variables.verifyCalls
+		var options = {
+			verify: ( identity, tokens, req ) => {
+				seen.append( { identity: identity, tokens: tokens } )
+				return { id: 42 }
+			}
+		}
+		options.append( authOptions, true )
+
+		var settings = {
+			clientId: variables.CLIENT_ID,
+			clientSecret: "tracker-secret",
+			callbackUrl: variables.endpoints.callback,
+			httpClient: variables.fake
+		}
+		if ( compare( kind, "google" ) != 0 ) {
+			settings.issuer = variables.IDP_ISSUER
+			settings.name = "idp"
+		}
+		settings.append( providerOptions, true )
+
+		var app = boxExpress()
+		app.use( boxExpressSession() )
+		var auth = boxExpressAuth( options )
+		auth.provider( variables.endpoints.name, compare( kind, "google" ) == 0 ? boxExpressAuthGoogle( settings ) : boxExpressAuthOIDC( settings ) )
+		app.use( "/auth", auth.routes() )
+		app.get( "/test/session", ( req, res ) => res.json( { session: req.session } ) )
+		app.use( ( err, req, res, next ) => res.status( 500 ).json( { errorType: err.type ?: "", message: err.message ?: "" } ) )
+		variables.auth = auth
+		return app
+	}
+
+	function standardClaims( required string nonce ) {
+		var now = variables.idp.nowSeconds()
+		return {
+			iss: variables.endpoints.issuer,
+			aud: variables.CLIENT_ID,
+			sub: "user-123",
+			email: "ada@example.com",
+			email_verified: true,
+			name: "Ada Lovelace",
+			preferred_username: "ada",
+			picture: "https://example.com/ada.png",
+			iat: now,
+			exp: now + 300,
+			nonce: nonce
+		}
+	}
+
+	/**
+	 * Start a login, mint the token endpoint's response for it, and run the
+	 * callback.
+	 *
+	 * @claims   merged over standardClaims(); a key set to "__remove__" is deleted
+	 * @mint     ( claims ) => id_token string, to sign differently
+	 */
+	function oidcLogin( app, struct claims = {}, any mint = "", struct startQuery = {} ) {
+		var started = app.inject( { url: "/auth/#variables.endpoints.name#", query: startQuery } )
+		var location = started.header( "Location" )
+		var nonce = queryParam( location, "nonce" )
+		var finalClaims = standardClaims( nonce )
+		for ( var key in claims ) {
+			if ( isSimpleValue( claims[ key ] ) && compare( claims[ key ], "__remove__" ) == 0 ) {
+				structDelete( finalClaims, key )
+			} else {
+				finalClaims[ key ] = claims[ key ]
+			}
+		}
+		var idToken = isSimpleValue( mint ) ? variables.idp.sign( finalClaims ) : mint( finalClaims )
+		variables.fake.respond( "POST #variables.endpoints.token#", { body: { access_token: "at-oidc-secret", token_type: "Bearer", id_token: idToken, expires_in: 3599 } } )
+		var finished = app.inject( {
+			url: "/auth/#variables.endpoints.name#/callback",
+			query: { code: "oidc-code", state: queryParam( location, "state" ) },
+			cookies: started.cookies
+		} )
+		return { started: started, location: location, nonce: nonce, finished: finished }
+	}
+
+	function expectOidcFailure( flow, required string code ) {
+		expect( flow.finished.statusCode ).withContext( flow.finished.body ).toBe( 302 )
+		expect( flow.finished.header( "Location" ) ).toBe( "/login?error=" & code )
+		expect( variables.verifyCalls ).toBeEmpty()
+	}
+
+	function expectOidcSuccess( flow ) {
+		expect( flow.finished.statusCode ).withContext( flow.finished.body ).toBe( 302 )
+		expect( flow.finished.header( "Location" ) ).toBe( "/" )
+		expect( variables.verifyCalls ).toHaveLength( 1 )
+	}
+
+}

@@ -1,0 +1,19 @@
+/**
+ * Global BIF wrapping the generic OpenID Connect provider.
+ *
+ *   auth.provider( "keycloak", boxExpressAuthOIDC( {
+ *     name: "keycloak",
+ *     issuer: "https://sso.example.com/realms/tracker",
+ *     clientId: getSystemSetting( "OIDC_CLIENT_ID" ),
+ *     clientSecret: getSystemSetting( "OIDC_CLIENT_SECRET" ),
+ *     callbackUrl: "https://tracker.example.com/auth/keycloak/callback"
+ *   } ) )
+ */
+@BoxBIF
+class {
+
+	function invoke( options = {} ) {
+		return new bxModules.boxexpressauth.models.providers.OIDCProvider( options )
+	}
+
+}

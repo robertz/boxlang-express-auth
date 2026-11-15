@@ -1,0 +1,93 @@
+/**
+ * Just enough JWS to verify an OIDC ID token: split and decode a compact
+ * JWT, and check an RS256/RS384/RS512 signature against an RSA JWK. Not a
+ * general JWT library — no encryption, no HMAC, no "none", no creation.
+ */
+class {
+
+	variables.RSA_ALGORITHMS = {
+		"RS256": "SHA256withRSA",
+		"RS384": "SHA384withRSA",
+		"RS512": "SHA512withRSA"
+	}
+	variables.MIN_RSA_BITS = 2048
+
+	function init() {
+		variables.decoder = createObject( "java", "java.util.Base64" ).getUrlDecoder()
+		return this
+	}
+
+	function supportedAlgorithms() {
+		return structKeyArray( variables.RSA_ALGORITHMS )
+	}
+
+	/**
+	 * → { header, payload, signingInput, signature (bytes) }. Throws
+	 * BoxExpressAuth.InvalidToken for anything that isn't three base64url
+	 * segments holding a JSON header and a JSON claims object.
+	 */
+	function decode( required string token ) {
+		var parts = listToArray( token, ".", true )
+		if ( arrayLen( parts ) != 3 ) {
+			throw( type = "BoxExpressAuth.InvalidToken", message = "ID token is not a three-part JWS" )
+		}
+		for ( var part in parts ) {
+			if ( !reFind( "^[A-Za-z0-9_-]+$", part ) ) {
+				throw( type = "BoxExpressAuth.InvalidToken", message = "ID token has a segment that isn't base64url" )
+			}
+		}
+		var header = _jsonSegment( parts[ 1 ] )
+		var payload = _jsonSegment( parts[ 2 ] )
+		return {
+			header: header,
+			payload: payload,
+			signingInput: parts[ 1 ] & "." & parts[ 2 ],
+			signature: variables.decoder.decode( parts[ 3 ] )
+		}
+	}
+
+	/**
+	 * True only for a valid signature by this key. A key that can't be
+	 * built, is under 2048 bits, or an algorithm outside RS256/384/512 is
+	 * false, never an error.
+	 */
+	function verifyRsa( required struct decoded, required struct jwk, required string alg ) {
+		if ( !structKeyExists( variables.RSA_ALGORITHMS, alg ) || compare( jwk.kty ?: "", "RSA" ) != 0 ) {
+			return false
+		}
+		try {
+			var bigInteger = createObject( "java", "java.math.BigInteger" )
+			var modulus = bigInteger.init( javacast( "int", 1 ), variables.decoder.decode( jwk.n ) )
+			var exponent = bigInteger.init( javacast( "int", 1 ), variables.decoder.decode( jwk.e ) )
+			if ( modulus.bitLength() < variables.MIN_RSA_BITS ) {
+				return false
+			}
+			var keySpec = createObject( "java", "java.security.spec.RSAPublicKeySpec" ).init( modulus, exponent )
+			var publicKey = createObject( "java", "java.security.KeyFactory" ).getInstance( "RSA" ).generatePublic( keySpec )
+			var verifier = createObject( "java", "java.security.Signature" ).getInstance( variables.RSA_ALGORITHMS[ alg ] )
+			verifier.initVerify( publicKey )
+			verifier.update( charsetDecode( decoded.signingInput, "US-ASCII" ) )
+			return verifier.verify( decoded.signature )
+		} catch ( any e ) {
+			return false
+		}
+	}
+
+	function _jsonSegment( required string segment ) {
+		var text = ""
+		try {
+			text = charsetEncode( variables.decoder.decode( segment ), "UTF-8" )
+		} catch ( any e ) {
+			throw( type = "BoxExpressAuth.InvalidToken", message = "ID token segment doesn't decode" )
+		}
+		if ( !isJSON( text ) ) {
+			throw( type = "BoxExpressAuth.InvalidToken", message = "ID token segment isn't JSON" )
+		}
+		var parsed = jsonDeserialize( text )
+		if ( !isStruct( parsed ) ) {
+			throw( type = "BoxExpressAuth.InvalidToken", message = "ID token segment isn't a JSON object" )
+		}
+		return parsed
+	}
+
+}

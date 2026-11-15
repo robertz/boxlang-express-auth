@@ -12,12 +12,12 @@ class {
 	/**
 	 * Module version. Keep in sync with box.json.
 	 */
-	this.version = "0.1.0";
+	this.version = "0.2.0";
 
 	this.mapping = "boxexpressauth";
 
 	this.author = "Robert Zehnder";
-	this.description = "Pluggable OAuth2 login for BoxExpress apps — a generic authorization-code core with PKCE, and a GitHub provider.";
+	this.description = "Pluggable OAuth2 and OpenID Connect login for BoxExpress apps — PKCE authorization-code core, a generic OIDC provider, and GitHub and Google presets.";
 	this.webURL = "https://github.com/robertz/boxlang-express-auth";
 	this.disabled = false;
 

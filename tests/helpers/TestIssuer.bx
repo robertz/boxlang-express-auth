@@ -1,0 +1,76 @@
+/**
+ * A pretend OpenID Provider for specs: an RSA key pair, its JWKS, and
+ * signed ID tokens — so ID-token validation is tested against real RS256
+ * signatures without any network.
+ */
+class {
+
+	function init( string kid = "test-key-1", numeric bits = 2048 ) {
+		variables.kid = kid
+		var generator = createObject( "java", "java.security.KeyPairGenerator" ).getInstance( "RSA" )
+		generator.initialize( javacast( "int", bits ) )
+		variables.keyPair = generator.generateKeyPair()
+		variables.encoder = createObject( "java", "java.util.Base64" ).getUrlEncoder().withoutPadding()
+		return this
+	}
+
+	function getKid() {
+		return variables.kid
+	}
+
+	function jwk() {
+		var publicKey = variables.keyPair.getPublic()
+		return {
+			kty: "RSA",
+			use: "sig",
+			alg: "RS256",
+			kid: variables.kid,
+			n: variables.encoder.encodeToString( _unsigned( publicKey.getModulus().toByteArray() ) ),
+			e: variables.encoder.encodeToString( _unsigned( publicKey.getPublicExponent().toByteArray() ) )
+		}
+	}
+
+	function jwks() {
+		return { keys: [ jwk() ] }
+	}
+
+	/**
+	 * @header merged over { alg: "RS256", typ: "JWT", kid }
+	 * @javaAlgorithm what actually signs, so a spec can lie in the header
+	 */
+	function sign( required struct claims, struct header = {}, string javaAlgorithm = "SHA256withRSA" ) {
+		var fullHeader = { alg: "RS256", typ: "JWT", kid: variables.kid }
+		fullHeader.append( header, true )
+		var signingInput = _segment( jsonSerialize( fullHeader ) ) & "." & _segment( jsonSerialize( claims ) )
+		var signer = createObject( "java", "java.security.Signature" ).getInstance( javaAlgorithm )
+		signer.initSign( variables.keyPair.getPrivate() )
+		signer.update( charsetDecode( signingInput, "US-ASCII" ) )
+		return signingInput & "." & variables.encoder.encodeToString( signer.sign() )
+	}
+
+	function unsigned( required struct claims, struct header = {} ) {
+		var fullHeader = { alg: "none", typ: "JWT" }
+		fullHeader.append( header, true )
+		return _segment( jsonSerialize( fullHeader ) ) & "." & _segment( jsonSerialize( claims ) ) & ".AA"
+	}
+
+	function nowSeconds() {
+		return javacast( "long", createObject( "java", "java.lang.System" ).currentTimeMillis() / 1000 )
+	}
+
+	function _segment( required string text ) {
+		return variables.encoder.encodeToString( charsetDecode( text, "UTF-8" ) )
+	}
+
+	/**
+	 * BigInteger.toByteArray() leads with a 0x00 sign byte when the top bit
+	 * is set; JWK wants the plain unsigned big-endian value.
+	 */
+	function _unsigned( bytes ) {
+		if ( arrayLen( bytes ) > 1 && bytes[ 1 ] == 0 ) {
+			return createObject( "java", "java.util.Arrays" ).copyOfRange( bytes, javacast( "int", 1 ), javacast( "int", arrayLen( bytes ) ) )
+		}
+		return bytes
+	}
+
+}
