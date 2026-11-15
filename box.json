@@ -1,6 +1,6 @@
 {
     "name":"BoxExpressAuth",
-    "version":"0.1.0",
+    "version":"0.2.0",
     "author":"Robert Zehnder",
     "slug":"boxlang-express-auth",
     "shortDescription":"Pluggable OAuth2 and OpenID Connect login for BoxExpress apps: GitHub, Google, Keycloak, Authelia",
